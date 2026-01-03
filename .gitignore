@@ -1,0 +1,49 @@
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg*
+*.pyd
+*.log
+*.tmp
+*.bak
+*.swp
+pip-wheel-metadata/
+build/
+dist/
+/data.zip
+# Environments
+.env
+.env.*
+venv/
+.venv/
+# Large datasets & archives
+/data/
+data.zip
+
+# Model weights / checkpoints
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.tar
+*.tar.gz
+*.npz
+*.npy
+
+# Training outputs (placeholders; adjust if you keep results)
+train/LLaMA-Factory/output/
+train/LLaMA-Factory/checkpoints/
+train/LLaMA-Factory/logs/
+
+# Local results
+eval/**/*.json
+eval/**/*.txt
+
+

@@ -1,0 +1,12 @@
+transformers==4.52.4
+torch==2.6.0
+accelerate==1.2.1
+peft==0.15.2
+datasets==3.2.0
+editdistance==0.8.1
+nltk==3.9.1
+qwen-vl-utils[decord]==0.0.11
+bitsandbytes>=0.41.0  # For 4-bit quantization
+torchvision==0.21.0  # Compatible with torch 2.6.0
+tensorboard
+vllm==0.8.5

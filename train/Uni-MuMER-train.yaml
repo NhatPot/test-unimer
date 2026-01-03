@@ -1,0 +1,69 @@
+### model
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora  # Use LoRA for quantization-aware training
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+
+# QLoRA configuration for 4-bit quantization
+quantization_bit: 4
+quantization_type: nf4  # or fp4
+lora_target: all  # Apply LoRA to all linear layers
+lora_rank: 64
+lora_alpha: 16
+lora_dropout: 0.05
+
+# Use DeepSpeed for memory efficiency (optional, requires DeepSpeed)
+# deepspeed: examples/deepspeed/ds_z2_config.json
+
+### dataset
+dataset_dir: train  # Thư mục chứa dataset_info.json
+# You need load the datasets first before using them, following LLamaFactory settings.
+#dataset: parquet_crohme2023, parquet_crohme2023_can, parquet_crohme2023_error_find, parquet_crohme2023_error_fix, parquet_crohme2023_tree, parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_crohme_train_tree, parquet_hme100k_error_find, parquet_hme100k_error_fix, parquet_hme100k_train, parquet_hme100k_train_can, parquet_hme100k_train_tree, parquet_im2latex_v2_error_find, parquet_im2latex_v2_error_fix, parquet_im2latex_v2_train, parquet_im2latex_v2_train_can, parquet_im2latex_v2_train_tree, parquet_mathwriting_symbols, parquet_mathwriting_train, parquet_mathwriting_train_can, parquet_mathwriting_train_error_find, parquet_mathwriting_train_error_fix, parquet_mathwriting_train_tree
+dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_hme100k_train
+
+template: qwen2_vl
+cutoff_len: 2048 # 2048 is the default value
+max_samples: 500
+overwrite_cache: true
+preprocessing_num_workers: 4 # 16 is the default value
+dataloader_num_workers: 4 # 128 is the default value
+#streaming: true
+
+### output
+output_dir: saves/qwen2.5_vl-3b/qlora/sft/standred/uni-mumer_qlora
+logging_steps: 1
+save_steps: 1000  
+plot_loss: true
+overwrite_output_dir: true
+report_to: tensorboard
+
+### train
+per_device_train_batch_size: 2  # Reduced from 4 due to quantization overhead
+gradient_accumulation_steps: 64  # Increased to maintain effective batch size
+
+learning_rate: 1.0e-4  # Slightly higher for QLoRA
+num_train_epochs: 40 # 20 is the default value
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+save_only_model: true
+resume_from_checkpoint: null
+
+# no need to eval during training
+### eval
+# eval_dataset: crohme_2014,crohme_2016,crohme_2019
+# val_size: 0
+# per_device_eval_batch_size: 8
+# eval_strategy: steps
+# eval_steps: 1000
+

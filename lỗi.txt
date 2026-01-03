@@ -1,0 +1,36 @@
+(unimumer) nhat@nhat-Default-string:~/Uni-MuMER-project$ python scripts/vllm_infer.py
+INFO 01-01 18:16:03 [importing.py:53] Triton module has been replaced with a placeholder.
+INFO 01-01 18:16:03 [__init__.py:239] Automatically detected platform cuda.
+Running inference with the following parameters:
+Model: Uni-MuMER-Qwen2.5-VL-3B-checkpoint1
+Input directory: ./data/
+INFO:__main__:1 GPU(s) detected → tensor_parallel_size=1
+WARNING 01-01 18:16:06 [config.py:2972] Casting torch.bfloat16 to torch.float16.
+INFO 01-01 18:16:17 [config.py:717] This model supports multiple tasks: {'classify', 'score', 'generate', 'reward', 'embed'}. Defaulting to 'generate'.
+WARNING 01-01 18:16:17 [config.py:830] bitsandbytes quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+INFO 01-01 18:16:17 [config.py:2003] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 01-01 18:16:17 [cuda.py:93] To see benefits of async output processing, enable CUDA graph. Since, enforce-eager is enabled, async output processor cannot be used
+INFO 01-01 18:16:19 [core.py:58] Initializing a V1 LLM engine (v0.8.5) with config: model='Uni-MuMER-Qwen2.5-VL-3B-checkpoint1', speculative_config=None, tokenizer='Uni-MuMER-Qwen2.5-VL-3B-checkpoint1', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.float16, max_seq_len=2048, download_dir=None, load_format=bitsandbytes, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=bitsandbytes, enforce_eager=True, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='auto', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=None, served_model_name=Uni-MuMER-Qwen2.5-VL-3B-checkpoint1, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=True, chunked_prefill_enabled=True, use_async_output_proc=False, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"splitting_ops":[],"compile_sizes":[],"cudagraph_capture_sizes":[],"max_capture_size":0}
+WARNING 01-01 18:16:20 [utils.py:2522] Methods determine_num_available_blocks,device_config,get_cache_block_size_bytes,initialize_cache not implemented in <vllm.v1.worker.gpu_worker.Worker object at 0x71a019e1f7f0>
+INFO 01-01 18:16:20 [parallel_state.py:1004] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
+INFO 01-01 18:16:20 [cuda.py:221] Using Flash Attention backend on V1 engine.
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Unused or unrecognized kwargs: return_tensors, fps.
+WARNING 01-01 18:16:25 [topk_topp_sampler.py:69] FlashInfer is not available. Falling back to the PyTorch-native implementation of top-p & top-k sampling. For the best performance, please install FlashInfer.
+INFO 01-01 18:16:25 [gpu_model_runner.py:1329] Starting to load model Uni-MuMER-Qwen2.5-VL-3B-checkpoint1...
+WARNING 01-01 18:16:26 [vision.py:93] Current `vllm-flash-attn` has a bug inside vision module, so we use xformers backend instead. You can run `pip install flash-attn` to use flash-attention backend.
+INFO 01-01 18:16:26 [config.py:3614] cudagraph sizes specified by model runner [] is overridden by config []
+INFO 01-01 18:16:26 [loader.py:1187] Loading weights with BitsAndBytes quantization. May take a while ...
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:01<00:01,  1.76s/it]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:02<00:00,  1.25s/it]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:02<00:00,  1.32s/it]
+
+INFO 01-01 18:16:29 [gpu_model_runner.py:1347] Model loading took 2.3602 GiB and 3.771083 seconds
+Unused or unrecognized kwargs: return_tensors, fps.
+INFO 01-01 18:16:31 [gpu_model_runner.py:1620] Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 image items of the maximum feature size.
+INFO 01-01 18:16:45 [kv_cache_utils.py:634] GPU KV cache size: 11,216 tokens
+INFO 01-01 18:16:45 [kv_cache_utils.py:637] Maximum concurrency for 2,048 tokens per request: 5.48x
+INFO 01-01 18:16:45 [core.py:159] init engine (profile, create kv cache, warmup model) took 15.74 seconds
+Unused or unrecognized kwargs: return_tensors, fps.
+INFO 01-01 18:16:47 [core_client.py:439] Core engine process 0 ready.
