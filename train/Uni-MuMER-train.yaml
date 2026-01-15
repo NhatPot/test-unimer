@@ -30,11 +30,20 @@ dataset_dir: train  # Thư mục chứa dataset_info.json
 #dataset: parquet_crohme2023, parquet_crohme2023_can, parquet_crohme2023_error_find, parquet_crohme2023_error_fix, parquet_crohme2023_tree, parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_crohme_train_tree, parquet_hme100k_error_find, parquet_hme100k_error_fix, parquet_hme100k_train, parquet_hme100k_train_can, parquet_hme100k_train_tree, parquet_im2latex_v2_error_find, parquet_im2latex_v2_error_fix, parquet_im2latex_v2_train, parquet_im2latex_v2_train_can, parquet_im2latex_v2_train_tree, parquet_mathwriting_symbols, parquet_mathwriting_train, parquet_mathwriting_train_can, parquet_mathwriting_train_error_find, parquet_mathwriting_train_error_fix, parquet_mathwriting_train_tree
 #dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_hme100k_train
 # Kết hợp Full bộ CROHME (để học kỹ năng) + Vanilla HME100K (để học nhìn chữ)
-dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_tree, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_hme100k_train
+# Full (Tree-CoT+EDL+Counting)
+#dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_tree, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_hme100k_train
+#(Img→LaTeX)
+dataset: parquet_crohme_train
+# Tree-CoT
+#dataset: parquet_crohme_train_tree
+# EDL
+#dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
+# Counting
+#dataset: parquet_crohme_train_counting  
 
 template: qwen2_vl
 cutoff_len: 2048 # 2048 is the default value
-max_samples: 4000
+max_samples: 24000
 overwrite_cache: true
 preprocessing_num_workers: 4 # 16 is the default value
 dataloader_num_workers: 4 # 128 is the default value
