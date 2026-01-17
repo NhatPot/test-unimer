@@ -35,9 +35,9 @@ dataset_dir: train  # Thư mục chứa dataset_info.json
 #(Img→LaTeX)
 #dataset: parquet_crohme_train
 # Tree-CoT
-dataset: parquet_crohme_train_tree
+#dataset: parquet_crohme_train_tree
 # EDL
-#dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
+dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
 # Counting
 #dataset: parquet_crohme_train_counting  
 
