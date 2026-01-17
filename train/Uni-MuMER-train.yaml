@@ -37,13 +37,13 @@ dataset_dir: train  # Thư mục chứa dataset_info.json
 # Tree-CoT
 #dataset: parquet_crohme_train_tree
 # EDL
-#dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
+dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
 # Counting
-dataset: parquet_crohme_train_counting  
+#dataset: parquet_crohme_train_counting  
 
 template: qwen2_vl
 cutoff_len: 2048 # 2048 is the default value
-max_samples: 24000
+max_samples: 4417
 overwrite_cache: true
 preprocessing_num_workers: 4 # 16 is the default value
 dataloader_num_workers: 4 # 128 is the default value
