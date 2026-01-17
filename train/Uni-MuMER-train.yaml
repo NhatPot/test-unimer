@@ -37,9 +37,9 @@ dataset_dir: train  # Thư mục chứa dataset_info.json
 # Tree-CoT
 #dataset: parquet_crohme_train_tree
 # EDL
-dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
+#dataset: parquet_crohme_train_error_find, parquet_crohme_train_error_fix
 # Counting
-#dataset: parquet_crohme_train_counting  
+dataset: parquet_crohme_train_counting  
 
 template: qwen2_vl
 cutoff_len: 2048 # 2048 is the default value
