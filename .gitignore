@@ -46,4 +46,48 @@ train/LLaMA-Factory/logs/
 eval/**/*.json
 eval/**/*.txt
 
+# Training saves (checkpoints from local training)
+saves/
+/saves/
+
+# Notebook outputs & checkpoints
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# Backup files
+*.backup
+*.old
+*~
+
+# Temporary notebooks
+uni-mumer-project*.ipynb
+uni-mumer-kaggle-dagshub.ipynb
+templatedagshub.ipynb
+
+# Base model downloads
+Uni-MuMER-Qwen2.5-VL-3B/
+/Uni-MuMER-Qwen2.5-VL-3B/
+*.safetensors
+
+# Miniconda (Kaggle local install)
+miniconda/
+/kaggle/
+
+# DagsHub/MLflow local artifacts
+mlruns/
+.mlflow/
+mlflow_artifacts/
+
+# Archive files
+*.tar.gz
+*.zip
+*.7z
+saveEDL.tar.gz
+savesEDL.tar.gz
+unimumer_*.tar.gz
+
+# Misc
+settingDagshub.txt
+dagshubsetting.md
+lỗi.txt
 

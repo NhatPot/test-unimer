@@ -10,3 +10,5 @@ bitsandbytes>=0.41.0  # For 4-bit quantization
 torchvision==0.21.0  # Compatible with torch 2.6.0
 tensorboard
 vllm==0.8.5
+dagshub>=0.3.0  # DagsHub integration
+mlflow>=2.8.0  # MLflow tracking
