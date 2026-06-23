@@ -90,7 +90,7 @@ class TextEvaluator:
             pred = sample[pred_key]
             gt = sample[gt_key]
             
-            distance = editdistance.eval(pred.split(), gt.split())
+            distance = editdistance.eval(pred, gt)
             total_distance += distance
             total_length += len(gt)
         
@@ -365,4 +365,3 @@ if __name__ == "__main__":
     output_directory = "./example_data"   # Optional: where to save evaluation results
     
     evaluate_all_results(root_directory, output_directory)
-    

@@ -61,7 +61,6 @@ saves/
 
 # Temporary notebooks
 uni-mumer-project*.ipynb
-uni-mumer-kaggle-dagshub.ipynb
 templatedagshub.ipynb
 
 # Base model downloads

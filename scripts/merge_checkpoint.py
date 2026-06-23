@@ -132,7 +132,7 @@ def merge_checkpoint(
     print("=" * 60)
     print(f"Merged model saved to: {output_dir}")
     print(f"\nYou can now use this model for inference:")
-    print(f"  python scripts/infer.py \\")
+    print(f"  python scripts/vllm_infer.py \\")
     print(f"    --model {output_dir} \\")
     print(f"    --input-dir data/CROHME/prompts \\")
     print(f"    --output-dir data/CROHME/results")

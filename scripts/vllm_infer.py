@@ -15,15 +15,10 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 
-# Optional: official Qwen visual pre-processing (resize, patching …)
 try:
-    from qwen_vl_utils import (
-        process_vision_info,
-        vision_process,  # noqa: F401 (side-effect import)
-    )
-    from qwen_vl_utils.vision_process import fetch_image
-except ModuleNotFoundError:
-    vision_process = None  # type: ignore
+    from qwen_vl_utils import process_vision_info
+except ModuleNotFoundError as exc:
+    raise RuntimeError("qwen-vl-utils is required for multimodal inference") from exc
     
 from eval_metrics_calculator import evaluate_text_generation
 
@@ -31,6 +26,7 @@ from eval_metrics_calculator import evaluate_text_generation
 # Logging
 # -----------------------------------------------------------------------------#
 LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
@@ -121,11 +117,11 @@ def run_inference(
     output_dir: str | Path,
     *,
     suffix: str = "_pred",
-    max_tokens: int = 2048,
+    max_tokens: int = 512,
     temperature: float = 0.95,
     top_p: float = 0.8,
     top_k: int = 50,
-    batch_size: int = 32768,  # vLLM uses dynamic batching; this is just an upper limit
+    batch_size: int = 16,
 ) -> None:
     """
     Iterate over every ``*.json`` in ``input_dir`` and write predictions
@@ -133,23 +129,24 @@ def run_inference(
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
+    json_files = sorted(input_dir.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No JSON input found in: {input_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Device topology ----------------------------------------------------#
     gpu_cnt = torch.cuda.device_count()
-    tp_size = max(gpu_cnt, 1)
+    if gpu_cnt == 0:
+        raise RuntimeError("vLLM inference requires at least one CUDA GPU")
+
+    tp_size = gpu_cnt
     LOGGER.info("%d GPU(s) detected → tensor_parallel_size=%d", gpu_cnt, tp_size)
 
     # 2) Model & tokenizer --------------------------------------------------#
-    # 2) Model & tokenizer --------------------------------------------------#
-    # Cấu hình giới hạn kích thước ảnh để không bị OOM khi profiling
-    # Qwen2.5-VL xử lý ảnh theo dynamic resolution, ta cần giới hạn nó lại.
-    mm_limit = {
-        "max_num_pixels": 512 * 512,  # Giới hạn độ phân giải ảnh đầu vào (giảm xuống mức an toàn)
-        "min_num_pixels": 28 * 28,
-    }
-
-    #export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     llm = LLM(
         model=model_name,
         tensor_parallel_size=tp_size,
@@ -163,8 +160,6 @@ def run_inference(
         gpu_memory_utilization=0.95,  # Cho phép dùng tối đa VRAM (vì crash là do đỉnh tải, không phải do load model)
         max_model_len=2048,           # Giới hạn context text
         
-        # Giới hạn vision tokens (Thử thêm cái này nếu vLLM bản mới hỗ trợ)
-        # mm_processor_kwargs=mm_limit, 
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True, use_fast=False
@@ -175,7 +170,7 @@ def run_inference(
     )
 
     # 3) File loop ----------------------------------------------------------#
-    for json_path in sorted(input_dir.glob("*.json")):
+    for json_path in json_files:
         LOGGER.info("[FILE] %s", json_path.name)
         with json_path.open(encoding="utf-8") as fp:
             dataset: List[Dict] = json.load(fp)
@@ -287,18 +282,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="../Uni-MuMER-Qwen2.5-VL-3B-checkpoint1",
+        default=str(PROJECT_ROOT / "Uni-MuMER-Qwen2.5-VL-3B-checkpoint1"),
         help="Model path or Hugging Face repo (default: the large local checkpoint).",
     )
     parser.add_argument(
         "--input-dir",
-        default="../data",
-        help="Directory containing source JSON files. (default: ./data/)",
+        default=str(PROJECT_ROOT / "data"),
+        help="Directory containing source JSON files.",
     )
     parser.add_argument(
         "--output-dir",
-        default="outputs",
-        help="Directory to write prediction JSON files. (default: vl_outputs_32b)",
+        default=str(PROJECT_ROOT / "outputs"),
+        help="Directory to write prediction JSON files.",
     )
     parser.add_argument(
         "--suffix",
@@ -308,8 +303,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=2048,
-        help="Maximum number of tokens to generate (default: 2048).",
+        default=512,
+        help="Maximum number of tokens to generate (default: 512).",
     )
     parser.add_argument(
         "--temperature",
@@ -326,8 +321,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32768,
-        help="Number of samples per vLLM.generate() call (default: 32768).",
+        default=16,
+        help="Number of samples per vLLM.generate() call (default: 16).",
     )
     return parser.parse_args()
 

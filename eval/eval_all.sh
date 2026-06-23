@@ -64,7 +64,7 @@ for i in "${!scripts[@]}"; do
   out_dir="${dirs[i]}/results${SUFFIX:+_"$SUFFIX"}"   # output directory with optional suffix
   mkdir -p "$out_dir"       # ensure output directory exists
 
-  cmd=(python scripts/infer.py
+  cmd=(python scripts/vllm_infer.py
     --input-dir  "${dirs[i]}/prompts"
     --output-dir "${out_dir}"
     --model      "${MODEL}"
