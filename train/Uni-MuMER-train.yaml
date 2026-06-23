@@ -36,7 +36,7 @@ dataset: parquet_crohme_train
 #dataset: parquet_crohme_train_can 
 template: qwen2_vl
 cutoff_len: 2048 # 2048 is the default value
-max_samples: 8834
+max_samples: 2 # mẫu sapmle
 val_size: 0.02
 overwrite_cache: true
 preprocessing_num_workers: 4 # 16 is the default value
