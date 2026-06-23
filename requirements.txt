@@ -9,7 +9,7 @@ bitsandbytes>=0.41.0
 qwen-vl-utils[decord]==0.0.11
 vllm==0.8.5
 numpy==1.26.4
-opencv-python-headless==4.9.0.80
+opencv-python-headless==4.11.0.86
 editdistance==0.8.1
 nltk==3.9.1
 tensorboard
