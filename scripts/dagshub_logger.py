@@ -126,9 +126,15 @@ def upload_run(
     config_path: Path,
     output_dir: Path,
     project_dir: Path,
+    notebook_path: Path,
 ) -> None:
     if not output_dir.is_dir():
         raise FileNotFoundError(f"Training output not found: {output_dir}")
+
+    if not notebook_path.is_absolute():
+        notebook_path = project_dir / notebook_path
+    if not notebook_path.is_file():
+        raise FileNotFoundError(f"Notebook source not found: {notebook_path}")
 
     client, experiment = _configure(experiment_name)
     run = _find_run(client, experiment.experiment_id, run_uuid)
@@ -154,7 +160,7 @@ def upload_run(
             config_path,
             project_dir / "train" / "dataset_info.json",
             project_dir / "requirements.txt",
-            project_dir / "uni-mumer-kaggle-dagshub.ipynb",
+            notebook_path,
         ):
             if path.is_file():
                 mlflow.log_artifact(str(path), artifact_path="configuration")
@@ -186,6 +192,7 @@ def parse_args() -> argparse.Namespace:
     upload.add_argument("--config", type=Path, required=True)
     upload.add_argument("--output-dir", type=Path, required=True)
     upload.add_argument("--project-dir", type=Path, default=Path.cwd())
+    upload.add_argument("--notebook", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -200,6 +207,7 @@ def main() -> None:
             args.config,
             args.output_dir,
             args.project_dir.resolve(),
+            args.notebook,
         )
 
 

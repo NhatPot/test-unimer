@@ -77,6 +77,9 @@ mlruns/
 .mlflow/
 mlflow_artifacts/
 
+# Runtime training configs
+train/runtime_*.yaml
+
 # Archive files
 *.tar.gz
 *.zip
