@@ -247,12 +247,12 @@ def inference_with_transformers(
 
     # Import correct model class for Qwen2.5-VL
     try:
-        from transformers import Qwen2VLForConditionalGeneration
-        LOGGER.info("Using Qwen2VLForConditionalGeneration")
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        LOGGER.info("Using Qwen2_5_VLForConditionalGeneration")
     except ImportError:
-        # Fallback to AutoModelForVision2Seq or AutoModel
-        from transformers import AutoModel as Qwen2VLForConditionalGeneration
-        LOGGER.warning("Qwen2VLForConditionalGeneration not found, using AutoModel")
+        # Fallback to AutoModelForVision2Seq
+        from transformers import AutoModelForVision2Seq as Qwen2_5_VLForConditionalGeneration
+        LOGGER.warning("Qwen2_5_VLForConditionalGeneration not found, using AutoModelForVision2Seq")
 
     # Load base model with 4-bit quantization
     LOGGER.info(f"Loading base model: {model_path}")
@@ -263,7 +263,7 @@ def inference_with_transformers(
         bnb_4bit_use_double_quant=True,
     )
 
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         quantization_config=quantization_config,
         device_map="auto",
