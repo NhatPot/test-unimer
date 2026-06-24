@@ -30,12 +30,13 @@ def convert_backup_to_prompts(
     backup_json_path: str | Path,
     output_prompts_path: str | Path,
     project_dir: str | Path,
+    images_base_dir: str | Path = "data/CROHME",
 ) -> Path:
     """
     Convert backup JSON format to prompts format.
 
     Input (backup):
-        [{"image": "relative/path.png", "latex": "x^2"}]
+        [{"img_id": "514_em_341", "gt": "x^2", ...}]
 
     Output (prompts):
         [{
@@ -50,6 +51,7 @@ def convert_backup_to_prompts(
         backup_json_path: Path to backup JSON file
         output_prompts_path: Path to output prompts JSON file
         project_dir: Project root directory for resolving image paths
+        images_base_dir: Base directory containing test images
 
     Returns:
         Path to created prompts file
@@ -57,6 +59,7 @@ def convert_backup_to_prompts(
     backup_path = Path(backup_json_path)
     output_path = Path(output_prompts_path)
     project_dir = Path(project_dir)
+    images_base_dir = Path(images_base_dir)
 
     LOGGER.info(f"Converting {backup_path} to prompts format...")
 
@@ -69,12 +72,48 @@ def convert_backup_to_prompts(
         "Please write out the expression of the formula in the image using LaTeX format."
     )
 
+    # Determine dataset name from backup filename
+    dataset_name = backup_path.stem  # e.g., "crohme_2014"
+
+    # Map dataset name to year folder (crohme_2014 -> 2014)
+    dataset_year_map = {
+        "crohme_2014": "2014",
+        "crohme_2016": "2016",
+        "crohme_2019": "2019",
+    }
+    year_folder = dataset_year_map.get(dataset_name, dataset_name)
+
+    skipped = 0
     for item in backup_data:
-        # Resolve image path
-        image_path = item.get("image", "")
-        if not Path(image_path).is_absolute():
-            # Convert relative path to absolute
-            image_path = str(project_dir / image_path)
+        # Get img_id and gt from backup JSON
+        img_id = item.get("img_id", "")
+        gt = item.get("gt", "")
+
+        if not img_id or not gt:
+            skipped += 1
+            continue
+
+        # Construct image path: data/CROHME/{year}/images/{img_id}.jpg
+        # Try common image extensions
+        image_path = None
+        for ext in [".jpg", ".png", ".jpeg", ".bmp"]:
+            candidate = project_dir / images_base_dir / year_folder / "images" / f"{img_id}{ext}"
+            if candidate.exists():
+                image_path = str(candidate)
+                break
+
+        if not image_path:
+            # Fallback: try without "images" subdirectory
+            for ext in [".jpg", ".png", ".jpeg", ".bmp"]:
+                candidate = project_dir / images_base_dir / year_folder / f"{img_id}{ext}"
+                if candidate.exists():
+                    image_path = str(candidate)
+                    break
+
+        if not image_path:
+            LOGGER.warning(f"Image not found for {img_id}, skipping...")
+            skipped += 1
+            continue
 
         prompts_data.append({
             "images": [image_path],
@@ -85,7 +124,7 @@ def convert_backup_to_prompts(
                 },
                 {
                     "from": "gpt",
-                    "value": item.get("latex", "")
+                    "value": gt
                 }
             ]
         })
@@ -96,6 +135,9 @@ def convert_backup_to_prompts(
         json.dump(prompts_data, f, indent=2, ensure_ascii=False)
 
     LOGGER.info(f"✓ Converted {len(prompts_data)} samples → {output_path}")
+    if skipped > 0:
+        LOGGER.warning(f"⚠ Skipped {skipped} samples (missing img_id, gt, or image file)")
+
     return output_path
 
 
