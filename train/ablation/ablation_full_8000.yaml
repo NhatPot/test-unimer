@@ -1,0 +1,70 @@
+### model
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+quantization_bit: 4
+quantization_type: nf4
+lora_target: all
+lora_rank: 64
+lora_alpha: 16
+lora_dropout: 0.05
+
+### dataset
+dataset_dir: train
+# Ablation: Full (Tree-CoT + EDL + Symbol Counting)
+# 4000 parquet_crohme_train + 1000 parquet_crohme_train_tree + 1000 parquet_crohme_train_can + 1000 parquet_crohme_train_error_find + 1000 parquet_crohme_train_error_fix
+dataset: ablation_full_8000
+template: qwen2_vl
+cutoff_len: 2048
+val_size: 0.02
+overwrite_cache: true
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/ablation/full_8000
+run_name: ablation-full-8000
+logging_steps: 10
+save_strategy: steps
+save_steps: 100
+save_total_limit: 2
+plot_loss: true
+overwrite_output_dir: true
+report_to:
+  - tensorboard
+  - mlflow
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 64
+learning_rate: 1.0e-4
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: false
+fp16: true
+ddp_timeout: 180000000
+save_only_model: true
+resume_from_checkpoint: null
+include_effective_tokens_per_second: true
+seed: 42
+
+### eval
+do_eval: true
+eval_strategy: steps
+eval_steps: 100
+per_device_eval_batch_size: 1
+compute_accuracy: true
+batch_eval_metrics: true
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false

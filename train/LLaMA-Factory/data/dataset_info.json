@@ -730,5 +730,45 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "ablation_baseline_8000": {
+    "file_name": "data/ablation/ablation_baseline_8000.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    }
+  },
+  "ablation_tree_8000": {
+    "file_name": "data/ablation/ablation_tree_8000.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    }
+  },
+  "ablation_edl_8000": {
+    "file_name": "data/ablation/ablation_edl_8000.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    }
+  },
+  "ablation_counting_8000": {
+    "file_name": "data/ablation/ablation_counting_8000.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    }
+  },
+  "ablation_full_8000": {
+    "file_name": "data/ablation/ablation_full_8000.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    }
   }
 }
