@@ -35,7 +35,7 @@ output_dir: saves/ablation/baseline_8000
 run_name: ablation-baseline-8000
 logging_steps: 10
 save_strategy: steps
-save_steps: 100
+save_steps: 23
 save_total_limit: 2
 plot_loss: true
 overwrite_output_dir: true
@@ -61,7 +61,7 @@ seed: 42
 ### eval
 do_eval: true
 eval_strategy: steps
-eval_steps: 100
+eval_steps: 23
 per_device_eval_batch_size: 1
 compute_accuracy: true
 batch_eval_metrics: true
