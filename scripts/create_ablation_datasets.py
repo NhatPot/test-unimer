@@ -6,16 +6,21 @@ This script samples from source datasets (parquet_crohme_train, parquet_crohme_t
 to create fixed ablation datasets with controlled ratios for fair comparison.
 
 Usage:
-    python scripts/create_ablation_datasets.py --seed 42 --output-dir data/ablation
+    python scripts/create_ablation_datasets.py --seed 42 --output-dir train/ablation_data
 """
 
 import argparse
 import json
 import logging
-import random
+from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
+try:
+    from datasets import Dataset, concatenate_datasets, load_dataset
+    HF_DATASETS_AVAILABLE = True
+except ImportError:
+    HF_DATASETS_AVAILABLE = False
+    import pandas as pd
 
 # Setup logging
 logging.basicConfig(
@@ -59,26 +64,76 @@ def load_dataset_info(dataset_info_path: Path) -> dict:
         return json.load(f)
 
 
-def load_parquet_dataset(file_path: Path) -> pd.DataFrame:
-    """Load a parquet dataset."""
-    LOGGER.info(f"Loading dataset from {file_path}")
-    df = pd.read_parquet(file_path)
-    LOGGER.info(f"  Loaded {len(df)} samples")
-    return df
+def load_hf_dataset_subset(dataset_name: str, dataset_info: dict, project_dir: Path):
+    """
+    Load dataset from HuggingFace or local parquet using datasets library.
+
+    Returns:
+        Dataset object from HuggingFace datasets library
+    """
+    if not HF_DATASETS_AVAILABLE:
+        raise ImportError("HuggingFace datasets library required. Install: pip install datasets")
+
+    config = dataset_info[dataset_name]
+
+    # Try HuggingFace Hub first
+    if "hf_hub_url" in config:
+        hf_url = config["hf_hub_url"]
+        subset = config.get("subset")
+
+        LOGGER.info(f"  Loading from HuggingFace: {hf_url}, subset={subset}")
+        ds = load_dataset(hf_url, subset, split="train")
+        return ds
+
+    # Fallback: local parquet
+    elif "file_name" in config:
+        file_path = project_dir / config["file_name"]
+        LOGGER.info(f"  Loading from local: {file_path}")
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {file_path}")
+
+        ds = load_dataset("parquet", data_files=str(file_path), split="train")
+        return ds
+
+    else:
+        raise ValueError(f"Dataset {dataset_name} has no hf_hub_url or file_name")
 
 
-def sample_from_dataset(df: pd.DataFrame, n_samples: int, seed: int) -> pd.DataFrame:
-    """Sample n_samples from dataframe with fixed seed."""
-    if len(df) < n_samples:
-        LOGGER.warning(
-            f"Dataset has only {len(df)} samples, but requested {n_samples}. "
-            f"Using all available samples."
-        )
-        return df.copy()
+def validate_parquet(file_path: Path, expected_count: int = 8000) -> bool:
+    """
+    Validate parquet has correct number of samples and schema.
+    Does not assert dtype to avoid false negatives.
+    """
+    if not HF_DATASETS_AVAILABLE:
+        import pandas as pd
+        df = pd.read_parquet(file_path)
 
-    # Sample with fixed seed
-    sampled = df.sample(n=n_samples, random_state=seed)
-    return sampled.reset_index(drop=True)
+        if len(df) != expected_count:
+            LOGGER.error(f"Expected {expected_count} samples, got {len(df)}")
+            return False
+
+        if "conversations" not in df.columns or "image" not in df.columns:
+            LOGGER.error("Missing required columns: conversations, image")
+            return False
+
+        LOGGER.info(f"  Image dtype: {df['image'].dtype}")
+        LOGGER.info(f"  Conversations dtype: {df['conversations'].dtype}")
+        return True
+
+    else:
+        ds = load_dataset("parquet", data_files=str(file_path), split="train")
+
+        if len(ds) != expected_count:
+            LOGGER.error(f"Expected {expected_count} samples, got {len(ds)}")
+            return False
+
+        if "conversations" not in ds.column_names or "image" not in ds.column_names:
+            LOGGER.error("Missing required columns: conversations, image")
+            return False
+
+        LOGGER.info(f"  Columns: {ds.column_names}")
+        return True
 
 
 def create_ablation_dataset(
@@ -91,6 +146,7 @@ def create_ablation_dataset(
 ) -> Path:
     """
     Create one ablation dataset by sampling from source datasets.
+    Uses HuggingFace datasets library to preserve image encoding.
 
     Args:
         config_name: Name of ablation config (e.g., "ablation_tree_8000")
@@ -107,48 +163,98 @@ def create_ablation_dataset(
     LOGGER.info(f"Creating {config_name}")
     LOGGER.info("="*80)
 
-    all_samples = []
+    if not HF_DATASETS_AVAILABLE:
+        raise ImportError("HuggingFace datasets library required for this operation")
+
+    all_datasets = []
 
     for dataset_name, n_samples in sampling_config.items():
         LOGGER.info(f"\nSampling {n_samples} from {dataset_name}...")
 
-        # Get dataset file path
         if dataset_name not in dataset_info:
             raise ValueError(f"Dataset {dataset_name} not found in dataset_info.json")
 
-        dataset_config = dataset_info[dataset_name]
-        file_path = project_dir / dataset_config["file_name"]
+        # Load from HF or local
+        ds = load_hf_dataset_subset(dataset_name, dataset_info, project_dir)
 
-        if not file_path.exists():
-            raise FileNotFoundError(f"Dataset file not found: {file_path}")
+        # Sample with seed
+        if len(ds) < n_samples:
+            LOGGER.warning(f"Dataset has only {len(ds)}, using all samples")
+            sampled_ds = ds
+        else:
+            sampled_ds = ds.shuffle(seed=seed).select(range(n_samples))
 
-        # Load and sample
-        df = load_parquet_dataset(file_path)
-        sampled_df = sample_from_dataset(df, n_samples, seed)
+        LOGGER.info(f"  ✓ Sampled {len(sampled_ds)} samples")
+        all_datasets.append(sampled_ds)
 
-        LOGGER.info(f"  ✓ Sampled {len(sampled_df)} samples")
-        all_samples.append(sampled_df)
+    # Concatenate (no pandas conversion)
+    LOGGER.info(f"\nMerging {len(all_datasets)} datasets...")
+    merged_ds = concatenate_datasets(all_datasets)
+    LOGGER.info(f"  Total: {len(merged_ds)} samples")
 
-    # Concatenate all samples
-    LOGGER.info(f"\nMerging all samples...")
-    merged_df = pd.concat(all_samples, ignore_index=True)
-    LOGGER.info(f"  Total before shuffle: {len(merged_df)} samples")
-
-    # Shuffle with fixed seed
+    # Shuffle
     LOGGER.info(f"Shuffling with seed={seed}...")
-    merged_df = merged_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    merged_ds = merged_ds.shuffle(seed=seed)
 
-    # Save to parquet
+    # Save to parquet using Dataset.to_parquet (preserves encoding)
     output_path = output_dir / f"{config_name}.parquet"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     LOGGER.info(f"Saving to {output_path}...")
-    merged_df.to_parquet(output_path, index=False)
+    merged_ds.to_parquet(output_path)
 
-    LOGGER.info(f"✓ Created {config_name}: {len(merged_df)} samples")
+    LOGGER.info(f"✓ Created {config_name}: {len(merged_ds)} samples")
     LOGGER.info(f"  Saved to: {output_path}")
 
+    # Validate
+    LOGGER.info(f"Validating {config_name}...")
+    if validate_parquet(output_path, expected_count=8000):
+        LOGGER.info(f"  ✓ Validation passed")
+    else:
+        raise RuntimeError(f"Validation failed for {config_name}")
+
     return output_path
+
+
+def create_manifest(output_dir: Path, seed: int, created_files: list, configs_built: dict) -> Path:
+    """
+    Create manifest JSON file for ablation datasets audit.
+
+    Args:
+        output_dir: Output directory
+        seed: Random seed used
+        created_files: List of created parquet file paths
+        configs_built: Dict of configs that were actually built
+
+    Returns:
+        Path to manifest JSON
+    """
+    manifest = {
+        "seed": seed,
+        "created_at": datetime.now().isoformat(),
+        "total_configs": len(configs_built),
+        "configs": configs_built
+    }
+
+    manifest_path = output_dir / "ablation_manifest.json"
+
+    # Update existing manifest if exists
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                existing_manifest = json.load(f)
+            # Merge configs
+            existing_manifest["configs"].update(configs_built)
+            existing_manifest["total_configs"] = len(existing_manifest["configs"])
+            manifest = existing_manifest
+        except:
+            pass  # Use new manifest if can't read existing
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    LOGGER.info(f"✓ Created/updated manifest: {manifest_path}")
+    return manifest_path
 
 
 def main():
@@ -176,8 +282,14 @@ def main():
     parser.add_argument(
         "--dataset-info",
         type=str,
-        default="train/LLaMA-Factory/data/dataset_info.json",
-        help="Path to dataset_info.json (default: train/LLaMA-Factory/data/dataset_info.json)",
+        default="train/dataset_info.json",
+        help="Path to dataset_info.json (default: train/dataset_info.json)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        choices=list(ABLATION_CONFIGS.keys()),
+        help="Specific config to build (e.g., ablation_baseline_8000). If not specified, build all configs.",
     )
 
     args = parser.parse_args()
@@ -209,9 +321,17 @@ def main():
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine which configs to build
+    if args.config:
+        LOGGER.info(f"Building single config: {args.config}")
+        configs_to_build = {args.config: ABLATION_CONFIGS[args.config]}
+    else:
+        LOGGER.info("Building all configs")
+        configs_to_build = ABLATION_CONFIGS
+
     # Create each ablation dataset
     created_files = []
-    for config_name, sampling_config in ABLATION_CONFIGS.items():
+    for config_name, sampling_config in configs_to_build.items():
         try:
             output_path = create_ablation_dataset(
                 config_name=config_name,
@@ -226,6 +346,12 @@ def main():
             LOGGER.error(f"Failed to create {config_name}: {e}")
             raise
 
+    # Create manifest
+    LOGGER.info("\n" + "="*80)
+    LOGGER.info("Creating manifest")
+    LOGGER.info("="*80)
+    manifest_path = create_manifest(output_dir, args.seed, created_files, configs_to_build)
+
     # Summary
     LOGGER.info("\n" + "="*80)
     LOGGER.info("Summary")
@@ -238,8 +364,8 @@ def main():
     LOGGER.info("\n" + "="*80)
     LOGGER.info("Next steps:")
     LOGGER.info("="*80)
-    LOGGER.info("1. Register these datasets in train/LLaMA-Factory/data/dataset_info.json")
-    LOGGER.info("2. Create YAML configs in train/ablation/")
+    LOGGER.info("1. Register these datasets in train/dataset_info.json")
+    LOGGER.info("2. Verify with Cell 5.5 in notebook")
     LOGGER.info("3. Train each config and compare results")
     LOGGER.info("")
 

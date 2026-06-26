@@ -93,3 +93,8 @@ settingDagshub.txt
 dagshubsetting.md
 lỗi.txt
 
+# Ablation datasets (large parquet files only)
+train/ablation_data/*.parquet
+
+# Keep manifest for audit
+!train/ablation_data/ablation_manifest.json
