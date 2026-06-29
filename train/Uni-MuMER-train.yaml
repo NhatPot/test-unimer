@@ -25,9 +25,9 @@ dataset_dir: train
 #dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_hme100k_train
 # Kết hợp Full bộ CROHME (để học kỹ năng) + Vanilla HME100K (để học nhìn chữ)
 # Full (Tree-CoT+EDL+Counting)
-#dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_tree, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_hme100k_train
+dataset: parquet_crohme_train, parquet_crohme_train_can, parquet_crohme_train_tree, parquet_crohme_train_error_find, parquet_crohme_train_error_fix, parquet_hme100k_train
 #(Img→LaTeX)
-dataset: parquet_crohme_train
+#dataset: parquet_crohme_train
 # Tree-CoT
 #dataset: parquet_crohme_train_tree
 # EDL
@@ -36,7 +36,7 @@ dataset: parquet_crohme_train
 #dataset: parquet_crohme_train_can 
 template: qwen2_vl
 cutoff_len: 2048 # 2048 is the default value
-max_samples: 2 # mẫu sapmle
+max_samples: 8000 # mẫu sapmle
 val_size: 0.02
 overwrite_cache: true
 preprocessing_num_workers: 4 # 16 is the default value
@@ -48,7 +48,7 @@ output_dir: saves/qwen2.5_vl-3b/qlora/sft/standred/uni-mumer_qlora
 run_name: uni-mumer-kaggle
 logging_steps: 1
 save_strategy: steps
-save_steps: 20
+save_steps: 50
 save_total_limit: 2
 plot_loss: true
 overwrite_output_dir: true
@@ -73,7 +73,7 @@ include_effective_tokens_per_second: true
 ### eval
 do_eval: true
 eval_strategy: steps
-eval_steps: 20
+eval_steps: 50
 per_device_eval_batch_size: 1
 compute_accuracy: true
 batch_eval_metrics: true
