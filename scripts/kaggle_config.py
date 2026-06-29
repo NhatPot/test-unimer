@@ -15,13 +15,13 @@ from kaggle_secrets import UserSecretsClient
 
 def setup_kaggle_env(
     base_yaml_config="train/Uni-MuMER-train.yaml",
-    notebook_path="uni-mumer-kaggle-dagshub v8.ipynb",
+    notebook_path="uni-mumer-kaggle-dagshub v5.ipynb",
 ):
     """
     Setup all environment variables for Kaggle notebook.
 
     Args:
-        base_yaml_config: Path to YAML config (e.g., "train/ablation/ablation_baseline_8000.yaml")
+        base_yaml_config: Path to the training YAML config.
         notebook_path: Name of the notebook file
 
     Returns:
@@ -88,7 +88,7 @@ def setup_kaggle_env(
     print(f"MLflow: {os.environ['MLFLOW_TRACKING_URI']}")
     print(f"PROJECT_DIR: {PROJECT_DIR}")
     print(f"BASE_YAML_CONFIG: {base_yaml_config}")
-    print(f"Is Ablation Mode: {'ablation' in base_yaml_config}")
+    print(f"NOTEBOOK_PATH: {notebook_path}")
     print(f"PROJECT_DIR in sys.path: {PROJECT_DIR in sys.path}")
     print(f"PYTHONPATH: {os.environ.get('PYTHONPATH')}")
     print(f"runtime_yaml.py exists: {Path(PROJECT_DIR, 'scripts/runtime_yaml.py').exists()}")
