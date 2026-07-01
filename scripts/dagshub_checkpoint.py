@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import subprocess
 from pathlib import Path
 
 
@@ -129,3 +132,99 @@ def prepare_resume_checkpoint(
     print(f"Resume artifact: {artifact_path}")
     print(f"Local checkpoint: {local_checkpoint}")
     return str(local_checkpoint)
+
+
+def prepare_resume_checkpoint_via_python(
+    python: str | Path,
+    project_dir: str | Path,
+    output_dir: str | Path,
+    enabled: bool = False,
+    run_id: str = "",
+    run_uuid: str = "",
+    experiment_name: str = "",
+    artifact_path: str = "",
+    state_path: str | Path = "/kaggle/working/resume_checkpoint.json",
+    require_full_checkpoint: bool = True,
+) -> str | None:
+    """Run checkpoint download with the training Python environment."""
+    print(f"DagsHub Resume: {'ON' if enabled else 'OFF'}")
+    if not enabled:
+        os.environ.pop("RESUME_CHECKPOINT", None)
+        return None
+
+    state_path = Path(state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.unlink(missing_ok=True)
+
+    command = [
+        str(python),
+        "scripts/dagshub_checkpoint.py",
+        "--project-dir",
+        str(project_dir),
+        "--output-dir",
+        str(output_dir),
+        "--run-id",
+        run_id,
+        "--run-uuid",
+        run_uuid,
+        "--experiment",
+        experiment_name,
+        "--artifact-path",
+        artifact_path,
+        "--state-path",
+        str(state_path),
+    ]
+    if not require_full_checkpoint:
+        command.append("--allow-model-only")
+
+    subprocess.run(command, cwd=str(project_dir), check=True)
+    checkpoint = json.loads(state_path.read_text(encoding="utf-8"))["checkpoint"]
+    os.environ["RESUME_CHECKPOINT"] = checkpoint
+    return checkpoint
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download a DagsHub checkpoint for resume training.")
+    parser.add_argument("--project-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--run-uuid", default="")
+    parser.add_argument("--experiment", default="")
+    parser.add_argument("--artifact-path", required=True)
+    parser.add_argument("--state-path", required=True)
+    parser.add_argument("--allow-model-only", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    checkpoint = prepare_resume_checkpoint(
+        project_dir=args.project_dir,
+        output_dir=args.output_dir,
+        enabled=True,
+        run_id=args.run_id or None,
+        run_uuid=args.run_uuid or None,
+        experiment_name=args.experiment or None,
+        artifact_path=args.artifact_path,
+        require_full_checkpoint=not args.allow_model_only,
+    )
+
+    state_path = Path(args.state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "checkpoint": checkpoint,
+                "run_id": args.run_id,
+                "run_uuid": args.run_uuid,
+                "artifact_path": args.artifact_path,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    main()
