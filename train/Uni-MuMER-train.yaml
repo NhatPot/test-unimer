@@ -63,8 +63,8 @@ learning_rate: 1.0e-4
 num_train_epochs: 1
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-bf16: false
-fp16: true
+bf16: true
+fp16: false
 ddp_timeout: 180000000
 save_only_model: false
 resume_from_checkpoint: null
