@@ -15,3 +15,6 @@ nltk==3.9.1
 tensorboard
 
 mlflow==3.14.0
+requests
+pandas
+tabulate
