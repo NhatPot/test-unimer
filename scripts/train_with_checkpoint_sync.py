@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -45,18 +46,28 @@ def _configure_mlflow(experiment_name: str):
         raise RuntimeError(f"Missing DagsHub credentials: {', '.join(missing)}")
 
     mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
-    experiment = mlflow.set_experiment(experiment_name)
-    return MlflowClient(), experiment.experiment_id
+    client = MlflowClient()
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise RuntimeError("MLflow experiment not found")
+    return client, experiment.experiment_id
 
 
 def _find_run(client, experiment_id: str, run_uuid: str):
+    _validate_run_uuid(run_uuid)
     runs = client.search_runs(
         [experiment_id],
         filter_string=f"tags.run_uuid = '{run_uuid}'",
-        max_results=1,
-        order_by=["attributes.start_time DESC"],
+        max_results=2,
     )
+    if len(runs) > 1:
+        raise RuntimeError("Ambiguous MLflow run_uuid: multiple runs found")
     return runs[0] if runs else None
+
+
+def _validate_run_uuid(run_uuid: str) -> None:
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", run_uuid):
+        raise ValueError("run_uuid must be a full hexadecimal UUID")
 
 
 def _wait_for_run(
@@ -148,10 +159,18 @@ def _sync_checkpoints_once(
     state_path: Path,
     stable_seconds: int,
     require_full_checkpoint: bool,
+    final: bool = False,
 ) -> int:
     import mlflow
 
     state = _load_state(state_path)
+    identity = {"run_id": run_id, "artifact_path": artifact_path.strip("/"),
+                "output_dir": str(output_dir.resolve())}
+    if state.get("identity") != identity:
+        # Old acknowledgements cannot establish that this run received a checkpoint.
+        state["uploaded"] = {}
+        state.pop("latest", None)
+    state["identity"] = identity
     uploaded: dict[str, Any] = state.setdefault("uploaded", {})
     checkpoint_dirs = sorted(
         (path for path in output_dir.glob("checkpoint-*") if _checkpoint_step(path) >= 0),
@@ -170,6 +189,8 @@ def _sync_checkpoints_once(
             require_full_checkpoint=require_full_checkpoint,
         )
         if not ready:
+            if final:
+                raise RuntimeError(f"Final checkpoint is not ready: {name} ({reason})")
             print(f"[checkpoint-sync] Skip {name}: {reason}", flush=True)
             continue
 
@@ -188,6 +209,7 @@ def _sync_checkpoints_once(
             "step": _checkpoint_step(checkpoint_dir),
             "artifact_path": target,
             "uploaded_at": int(time.time()),
+            "verification": "not_verified",
         }
         state["latest"] = name
         _save_state(state_path, state)
@@ -206,7 +228,9 @@ def _watch_checkpoints(
     stable_seconds: int,
     require_full_checkpoint: bool,
     stop_event: threading.Event,
+    failures: list[dict[str, str]] | None = None,
 ) -> None:
+    failures = failures if failures is not None else []
     try:
         client, experiment_id = _configure_mlflow(experiment_name)
         run = _wait_for_run(
@@ -231,12 +255,14 @@ def _watch_checkpoints(
                     require_full_checkpoint=require_full_checkpoint,
                 )
                 if count:
-                    print(f"[checkpoint-sync] Uploaded {count} checkpoint(s)", flush=True)
+                    print(f"[checkpoint-sync] Submitted {count} checkpoint(s); remote content not verified", flush=True)
             except Exception as exc:
-                print(f"[checkpoint-sync] Warning: {exc}", flush=True)
+                failures.append({"stage": "background_upload", "error_type": type(exc).__name__})
+                print(f"[checkpoint-sync] Background upload failed ({type(exc).__name__}); will retry", flush=True)
             stop_event.wait(interval_seconds)
     except Exception as exc:
-        print(f"[checkpoint-sync] Disabled: {exc}", flush=True)
+        failures.append({"stage": "background_setup", "error_type": type(exc).__name__})
+        print(f"[checkpoint-sync] Background sync stopped ({type(exc).__name__})", flush=True)
 
 
 def _final_sync(
@@ -248,24 +274,24 @@ def _final_sync(
     stable_seconds: int,
     require_full_checkpoint: bool,
 ) -> None:
-    try:
-        client, experiment_id = _configure_mlflow(experiment_name)
-        run = _find_run(client, experiment_id, run_uuid)
-        if not run:
-            print("[checkpoint-sync] Final sync skipped: MLflow run not found", flush=True)
-            return
-        count = _sync_checkpoints_once(
-            client=client,
-            run_id=run.info.run_id,
-            output_dir=output_dir,
-            artifact_path=artifact_path,
-            state_path=state_path,
-            stable_seconds=stable_seconds,
-            require_full_checkpoint=require_full_checkpoint,
-        )
-        print(f"[checkpoint-sync] Final sync uploaded {count} checkpoint(s)", flush=True)
-    except Exception as exc:
-        print(f"[checkpoint-sync] Final sync warning: {exc}", flush=True)
+    if not output_dir.is_dir():
+        raise FileNotFoundError("Training output directory missing during final checkpoint sync")
+    client, experiment_id = _configure_mlflow(experiment_name)
+    run = _find_run(client, experiment_id, run_uuid)
+    if not run:
+        raise RuntimeError("MLflow run not found during final checkpoint sync")
+    count = _sync_checkpoints_once(
+        client=client,
+        run_id=run.info.run_id,
+        output_dir=output_dir,
+        artifact_path=artifact_path,
+        state_path=state_path,
+        stable_seconds=stable_seconds,
+        require_full_checkpoint=require_full_checkpoint,
+        final=True,
+    )
+    print(f"[checkpoint-sync] Final checkpoint pass submitted {count} checkpoint(s); "
+          "not remote-verified. Full output upload/verification remains with dagshub_logger.", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -289,10 +315,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _validate_run_uuid(args.run_uuid)
     project_dir = args.project_dir.resolve()
     output_dir = _resolve_path(args.output_dir, project_dir)
     state_path = _resolve_path(args.state_path, project_dir)
     stop_event = threading.Event()
+    failures: list[dict[str, str]] = []
     process_holder: dict[str, subprocess.Popen[Any] | None] = {"process": None}
 
     def stop_handler(signum, _frame):
@@ -320,42 +348,90 @@ def main() -> None:
             "stable_seconds": args.stable_seconds,
             "require_full_checkpoint": not args.allow_model_only,
             "stop_event": stop_event,
+            "failures": failures,
         },
         daemon=True,
     )
-    watcher.start()
-
+    run_name = args.run_name if args.run_uuid in args.run_name else f"{args.run_name}-{args.run_uuid}"
     train_command = [
         "llamafactory-cli",
         "train",
         args.yaml_config,
-        f"run_name={args.run_name}",
         *args.train_overrides,
+        f"run_name={run_name}",
     ]
 
     print(f"[train-wrapper] YAML_CONFIG: {args.yaml_config}", flush=True)
     print(f"[train-wrapper] OUTPUT_DIR: {output_dir}", flush=True)
     print(f"[train-wrapper] Checkpoint sync interval: {args.interval_seconds}s", flush=True)
-    print(f"[train-wrapper] Command: {' '.join(train_command)}", flush=True)
+    # Never echo arbitrary overrides or SDK exceptions: either may contain credentials.
+    child_env = os.environ.copy()
+    tags = json.loads(child_env.get("MLFLOW_TAGS", "{}"))
+    if not isinstance(tags, dict):
+        raise ValueError("MLFLOW_TAGS must be a JSON object")
+    tags.update({"run_uuid": args.run_uuid,
+                 "experiment_variant": os.getenv("EXPERIMENT_VARIANT", "baseline")})
+    for name in ("SPLIT_MANIFEST", "DATASET_DIR", "SPLIT_SEED", "SPLIT_ID"):
+        if os.getenv(name):
+            tags[name.lower()] = os.environ[name]
+    child_env["RUN_UUID"] = args.run_uuid
+    child_env["MLFLOW_TAGS"] = json.dumps(tags)
 
-    process = subprocess.Popen(train_command, cwd=project_dir)
-    process_holder["process"] = process
-    return_code = process.wait()
-    stop_event.set()
-    watcher.join(timeout=10)
+    started = False
+    try:
+        process = subprocess.Popen(train_command, cwd=project_dir, env=child_env)
+        process_holder["process"] = process
+        watcher.start()
+        started = True
+        return_code = process.wait()
+    except OSError as exc:
+        print(f"[train-wrapper] Could not start/wait for training ({type(exc).__name__})", flush=True)
+        return_code = 127
+    finally:
+        stop_event.set()
+        if started:
+            # A timed join permits two MLflow writers and concurrent state-file writes.
+            watcher.join()
 
-    _final_sync(
-        experiment_name=args.experiment,
-        run_uuid=args.run_uuid,
-        output_dir=output_dir,
-        artifact_path=args.artifact_path,
-        state_path=state_path,
-        stable_seconds=1,
-        require_full_checkpoint=not args.allow_model_only,
-    )
+    final_ok = False
+    attempts = 0
+    if process_holder["process"] is not None:
+        for attempts in range(1, 3):
+            try:
+                _final_sync(
+                    experiment_name=args.experiment,
+                    run_uuid=args.run_uuid,
+                    output_dir=output_dir,
+                    artifact_path=args.artifact_path,
+                    state_path=state_path,
+                    stable_seconds=1,
+                    require_full_checkpoint=not args.allow_model_only,
+                )
+                final_ok = True
+                break
+            except Exception as exc:
+                failures.append({"stage": "final_sync", "error_type": type(exc).__name__})
+                print(f"[checkpoint-sync] Final checkpoint attempt {attempts}/2 failed "
+                      f"({type(exc).__name__})", flush=True)
 
-    sys.exit(return_code)
+    try:
+        state = _load_state(state_path)
+        state["sync_failures"] = failures
+        state["final_sync"] = {"status": "submitted" if final_ok else "failed",
+                               "verification": "not_verified", "attempts": attempts}
+        _save_state(state_path, state)
+    except Exception as exc:
+        print(f"[checkpoint-sync] Could not persist sync outcome ({type(exc).__name__})", flush=True)
+        final_ok = False
+    if failures:
+        print(f"[checkpoint-sync] Recorded {len(failures)} sync failure(s); "
+              f"final checkpoint pass {'completed' if final_ok else 'failed'}", flush=True)
+    sys.exit(return_code if return_code else (0 if final_ok else 1))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"Training wrapper failed ({type(exc).__name__}); exception details suppressed.", file=sys.stderr)
+        sys.exit(1)

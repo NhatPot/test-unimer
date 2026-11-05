@@ -1,64 +1,73 @@
-# Agent Instructions: test-unimer
+# Hướng dẫn cho AI Agent
 
-## Scope and source of truth
+Cập nhật 2026-11-06. Áp dụng cho Codex, subagent và Antigravity.
+Đọc file này; chỉ mở thêm tài liệu đúng nhiệm vụ. Không bắt đầu từ kế hoạch cũ.
 
-- This repository is the active Kaggle training and research project.
-- The active notebook is `uni-mumer-kaggle-dagshub-banmoi.ipynb`, as confirmed by the owner. Do not switch to v5, v8, or an exported snapshot based on its filename or timestamp.
-- Read `docs/README.md`, `docs/IMPLEMENTATION_PLAN.md`, and `docs/KAGGLE_RUNBOOK.md` before changing the pipeline.
-- Runtime configuration is the base `train/Uni-MuMER-train.yaml` plus notebook overrides. Inspect both; report the final values actually passed to training.
-- Dataset registration is `train/dataset_info.json` because the current YAML sets `dataset_dir: train`. Do not edit the vendored framework's example registry by mistake.
-- `/home/nhat/Uni-MuMER-project` contains previous models, results, and archives. Leave it untouched unless the user explicitly includes it in the task.
+Trước mắt CHỈ chuẩn bị baseline trên dev_tt. main là lịch sử; dev-caitien và
+weighted loss để sau khi baseline có kết quả. Không triển khai hai nhánh cùng lúc.
 
-## Permissions and preservation
+## Mục tiêu hiện tại
 
-- Explain findings and progress to the owner in simple Vietnamese.
-- A request to review, plan, or write documentation does not authorize implementation changes or training.
-- Do not install dependencies, download model/dataset artifacts, launch GPU jobs, or write to DagsHub without authorization for that work. A DagsHub connection check can create/delete a remote test run; it is not read-only.
-- Never delete, overwrite, reset, or clean existing models, checkpoints, results, notebooks, or unrelated local changes to make a command pass.
-- Inspect `git status` and relevant diffs before editing. Use narrow, explicit file lists when staging. Do not commit/push without the user's request.
-- Never print or commit tokens, passwords, `.env`, authenticated URLs, or notebook outputs containing secrets.
-- Preserve legacy results. The completeness audit found all expected image IDs in the 24 saved prediction files checked; a risky code path is not evidence that old runs lost samples.
+- So sánh A: QLoRA hiện tại và B: QLoRA tăng ưu tiên mẫu khó.
+- Cả hai khởi tạo từ cùng Qwen2.5-VL-3B-Instruct + LoRA mới, cùng seed.
+- Train mới 1 epoch trên cùng tập nhỏ; KHÔNG warm-start/resume checkpoint 700.
+- Chia 90% train / 10% validation theo ẢNH NGUỒN; mọi biến thể nhiệm vụ
+  của một ảnh nằm cùng phía. Giữ cùng manifest cho A/B, không dùng test làm val.
+- Đánh giá/lưu theo step như workflow cũ, dự kiến mỗi 5 optimizer step.
+  Chốt khoảng cách theo số bước thực tế; phải đo checkpoint cuối riêng.
+- B dự kiến tăng trọng số loss cho mẫu khó TRONG TRAIN, có giới hạn.
+  Giữ nguyên mẫu/số bước; chưa oversample hay thêm task-affinity/kiến trúc mới.
+  Đây là giả thuyết cần thử, chưa có code cải tiến hoặc bằng chứng hiệu quả.
+- Validation chỉ đo, dùng cùng loss chuẩn cho A/B; không lấy ảnh val cho model học.
+- Chi tiết cấu hình và thứ tự làm: docs/IMPLEMENTATION_PLAN.md.
 
-## Required Kaggle environment
+## Source và nơi chạy
 
-- All training, inference, evaluation, MLflow, dataset processing, and runtime YAML helpers must use a project-owned Python environment. Do not rely on Kaggle's preinstalled ML packages.
-- Keep the current Python 3.10 / Conda approach unless a separately tested migration is authorized. Expected interpreter: `/kaggle/working/miniconda/envs/unimumer/bin/python`.
-- Use the absolute interpreter for commands and `"$PYTHON" -m pip` for installs. Ensure subprocess CLI tools and `torchrun` also resolve inside that environment.
-- The notebook kernel is an orchestration surface only. Its platform bridge (`kaggle_secrets`) may retrieve credentials, but do not import project ML/YAML helpers in that kernel. Run those helpers in the isolated interpreter and return JSON or paths.
-- Disable user-site imports and do not inject Kaggle/system site-packages into `PYTHONPATH`. Allow only project source/editable framework paths in addition to the environment's own packages.
-- Install declared dependencies in a clean Kaggle session, then require `pip check`, import-path checks, and CUDA checks to pass. Do not suppress dependency conflicts or bypass them with an unexplained `--no-deps`.
-- Current requirements are a starting point, not a validated lockfile. Do not claim compatibility based on an old notebook's outputs or a successful import alone.
+- Repo này /home/nhat/test-unimer chứa workflow train để GitHub lưu và Kaggle clone.
+- Notebook chính: uni-mumer-kaggle-dagshub-banmoi.ipynb.
+- Notebook chỉ setup, chỉnh tham số, gọi script repo; giữ cell ngắn, thứ tự quen thuộc.
+- Cấu hình thực chạy = train/Uni-MuMER-train.yaml + notebook overrides.
+- Registry nguồn: train/dataset_info.json. scripts/prepare_baseline_data.py xuất
+  registry train/val riêng trong dataset_dir; không sửa registry ví dụ của framework.
+- Kaggle dùng Python 3.10 riêng và requirements project, không mượn ML packages
+  của kernel. Dùng PYTHON tuyệt đối; kernel chỉ điều phối/đọc Kaggle Secrets.
+- Mục tiêu 2 x T4, FP16; NF4 4-bit, LoRA rank64/alpha16/dropout0.05.
+  Hai GPU không gộp VRAM. Không tự đổi batch/LR/ảnh/chuỗi để né lỗi.
+- Inference/benchmark ở /home/nhat/Uni-MuMER-project trên RTX 3070.
+  Không tự sửa repo hoặc môi trường local đó trong nhiệm vụ train.
 
-## Hardware and experiment invariants
+## Khi nhận việc
 
-- Target profile is Kaggle 2 x NVIDIA T4, nominally 16 GB per GPU. Verify actual devices, VRAM, driver, CUDA, and distributed world size every session. Never infer them from a notebook heading.
-- Use FP16 for the T4 profile: `bf16: false`, `fp16: true`; inference compute dtype must agree. Do not copy BF16 from the current base YAML.
-- Two DDP GPUs do not provide one pooled 32 GB allocation. Each rank must fit on its own GPU.
-- Preserve the baseline backbone, NF4 4-bit quantization, LoRA rank 64, alpha 16, and dropout 0.05 unless the experiment explicitly changes them.
-- Effective batch = per-device batch x accumulation x actual world size. Record changes, including OOM mitigations. Never silently change image resolution or sequence length to fit memory.
-- `max_samples` caps each dataset, not the entire mixture. Count actual rows and unique source images. Keep dataset revision, split manifest, seed, and final runtime YAML with each run.
+1. Đọc git status và các file liên quan; giữ nguyên thay đổi có sẵn.
+2. Làm đúng phạm vi được giao. Sửa nhỏ trên workflow cũ; không tự xây lại pipeline.
+3. Backup notebook trước khi sửa. Kiểm thử nhẹ, báo file đổi và việc chưa kiểm chứng.
+4. Không nhét nhiều cờ review/setup, commit/hash bắt buộc hoặc kiểm tra lặp vào cell.
+   Không thêm helper chỉ để di chuyển sự phức tạp nếu workflow hiện có đã đáp ứng.
+5. Nhiều agent: mỗi file một người sửa, giao đầu ra rõ ràng. Auto-accept theo phạm vi,
+   không phải quyền sửa mọi file/chạy mọi lệnh. Không gọi lại worker đã xong chỉ để gửi luật.
 
-## Work order and acceptance gates
+## Trước GitHub hoặc Kaggle
 
-1. Inventory: read the active notebook, invoked scripts, YAML, dependencies, Git state, and existing artifacts. Record facts separately from assumptions.
-2. Stabilize execution: isolate all Python work, validate T4 precision/dependencies, identify the actual notebook and Git revision, and separate output/sync state per run. Add focused CPU tests before GPU tests.
-3. Secure checkpoints: distinguish a new run, full resume, and an adapter warm start. Validate configuration, weights, trainer/optimizer/scheduler state and applicable RNG/scaler state. Resolve the real MLflow run ID; an application UUID is only a tag.
-4. Validate data/evaluation: split by source image before creating task variants; assert image/label coverage; use deterministic generation and actual sample counts. Keep test sets outside adaptation and checkpoint selection.
-5. Authorized smoke test: run only a short, explicitly bounded job, verify checkpoint upload/download/resume and 1-3 inference samples. Save evidence; do not treat smoke metrics as a benchmark.
-6. Baseline and task ablations: use the same starting weights, clean split and matched budgets. Report tokens/GPU time as well as steps. Preserve data-source proportions where task effects are being compared.
-7. Adaptive learning: only after the previous gates pass, add structure features, task-affinity estimates and phase-wise sampling. Save sampler/RNG/phase state with checkpoints and test resume with the changed data stream.
+- Quy tắc thực hiện: docs/KAGGLE_RUNBOOK.md. GitHub phải có đủ helper/config đi kèm.
+- Không tự commit/push, cài thư viện, tải model/dataset hoặc chạy GPU khi chưa được giao.
+  Khi đã được giao một run rõ cấu hình/ngân sách, không hỏi lại từng thao tác nhỏ.
+- Trước MỌI sửa Kaggle: kiểm tra job đang chạy, export backup đọc được, ghi URL/version.
+  Không tự dừng job hoặc đổi source/dependency giữa run.
+- Không lộ token, .env hay URL có mật khẩu. Không xóa/ghi đè checkpoint hoặc kết quả cũ.
+- Lưu actual MLflow run ID + nhãn baseline/improved, commit, split và cấu hình cuối.
+  RUN_UUID là tag, không phải MLflow run ID. Upload lỗi không được báo thành công.
+- Tách rõ sửa local / đã push / đã cập nhật Kaggle / đã chạy thật. Test CPU không chứng
+  minh Kaggle đã chạy. Không đánh dấu kế hoạch là đã triển khai.
 
-## Stop conditions
+## Việc chưa làm và tài liệu cũ
 
-- Stop before expensive work if environment, GPU profile, precision, resolved YAML, paths, or checkpoint provenance do not match the declared run.
-- Stop a full benchmark on missing/duplicate/unexpected image IDs, missing labels, or runtime failures. A model-generated empty answer counts as an error; a missing image or CUDA failure must not be silently scored as a normal answer.
-- Do not silently replace a failed resume with training from scratch or reuse an old result directory as a new success.
-- Require verified remote upload before allowing retention logic to remove the only local resumable checkpoint. Handle interrupted uploads and concurrent final sync explicitly.
-- Never claim "Kaggle-ready" until a fresh Kaggle environment has passed the required installation, GPU, checkpoint, and smoke checks. Local static tests cannot establish that result.
-
-## Editing and handoff
-
-- Prefer existing helpers and keep changes outside `train/LLaMA-Factory` when practical. Do not upgrade the vendored framework as an unrelated cleanup.
-- Keep the notebook small; put reusable logic in scripts and test it independently. Preserve valid notebook JSON and cell boundaries.
-- Add regression tests for each changed contract: overrides, run identity, checkpoint state, sample coverage, metric denominators, and resume behavior.
-- Update the checklist only with evidence. Report changed files, tests actually run, tests not run, remaining risks, and the next permitted step.
+Notebook local đã cấu hình baseline 1 epoch, 1.000 dòng/nguồn và val 10% theo nhóm ảnh.
+Cell 5 (Thông số baseline) là nơi chỉnh mẫu/epoch/val; helper chuẩn bị subset rồi
+xuất YAML runtime, không cap/chia lần hai. Chưa tạo subset thật hoặc chạy Kaggle.
+Nhánh dev-caitien chưa tạo. Chi tiết: docs/reports/BASELINE_DEV_TT_2026_11_06.md.
+Các thư viện sync/timeout mới chưa nối đầy đủ vào đường chạy notebook.
+Việc tiếp theo là duyệt diff, chốt source GitHub, rồi chuẩn bị dữ liệu thật và chạy baseline
+trên Kaggle khi được giao. RUN_TRAINING mặc định False; không tự bật để kiểm thử local.
+Checkpoint 700 chỉ là kết quả lịch sử, KHÔNG phải điều kiện chặn thí nghiệm mới.
+docs/archive/ và docs/reports/ là snapshot tham khảo, không phải lệnh thực thi.
+Nếu tài liệu cũ mâu thuẫn, theo file này và IMPLEMENTATION_PLAN.md hiện tại.

@@ -1,61 +1,42 @@
-# Tài liệu vận hành và cải tiến Uni-MuMER
+# Bắt đầu ở đây
 
-## Đọc theo thứ tự
+## Chỉ cần đọc
 
-1. [AGENTS.md](../AGENTS.md): quy tắc bắt buộc cho agent khi làm việc trong repo.
-2. [Kế hoạch triển khai](IMPLEMENTATION_PLAN.md): sửa gì trước, kiểm tra gì, khi nào được chuyển bước.
-3. [Hướng dẫn Kaggle](KAGGLE_RUNBOOK.md): môi trường riêng, cấu hình T4, checkpoint và điều kiện chạy.
+1. [AGENTS.md](../AGENTS.md): quy tắc cho mọi AI agent.
+2. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md): phương án thí nghiệm hiện tại.
+3. [KAGGLE_RUNBOOK.md](KAGGLE_RUNBOOK.md): chỉ đọc khi chuẩn bị GitHub/Kaggle.
 
-Các tài liệu này là kế hoạch và tiêu chí nghiệm thu, không phải thông báo rằng code đã được sửa hoặc đã chạy thành công trên Kaggle.
+Không cần đọc hết lịch sử để bắt đầu một việc nhỏ.
 
-## Project nào làm việc gì?
+## Phương án đã chốt
 
-| Vị trí | Vai trò |
-| --- | --- |
-| `/home/nhat/test-unimer` | Repo đang phát triển, chuẩn bị thí nghiệm và chạy Kaggle |
-| `uni-mumer-kaggle-dagshub-banmoi.ipynb` | Notebook chính do chủ project xác nhận |
-| `train/Uni-MuMER-train.yaml` | Cấu hình nền; notebook có thể ghi đè |
-| `train/dataset_info.json` | Đăng ký dataset đang được YAML sử dụng |
-| `scripts/` | Train, đồng bộ checkpoint, tải checkpoint, inference và đánh giá |
-| `/home/nhat/Uni-MuMER-project` | Kết quả/model cũ để lưu trữ và đối chiếu; không tự sửa |
+Train mới A: QLoRA cũ và B: QLoRA ưu tiên mẫu khó từ cùng Qwen base + LoRA mới.
+Cùng tập nhỏ, 1 epoch, train/validation 90/10 theo ảnh nguồn; đánh giá theo step.
+Checkpoint 700 giữ làm lịch sử, không dùng khởi tạo. Nhánh B dự kiến dev-caitien.
 
-Không dùng bản trong `_output_` hay notebook v5/v8 thay cho notebook chính chỉ vì tên có vẻ mới hơn. Một số tài liệu ablation cũ vẫn còn, nhưng các script/config mà chúng nhắc đến không còn trên nhánh hiện tại.
+```text
+Local sửa source/config -> GitHub -> Kaggle clone
+ -> Python riêng + requirements -> train/validation -> DagsHub
+ -> AI lấy đúng run về phân tích khi được yêu cầu
+ -> inference/benchmark trên RTX 3070 local khi cần
+```
 
-## Mốc kiểm tra ban đầu
+Notebook là bảng điều khiển ngắn; workflow nằm trong source, không nằm rải rác
+trong các cell dài hoặc chỉnh tay ngoài Git.
 
-Ngày ghi nhận: 2026-11-02. Git HEAD của `test-unimer`: `72274d5afd420054fb2e0478aa931ce3ccc09a88`.
+## Trạng thái thật
 
-- Notebook `banmoi` đang là file untracked tại mốc này; bản đang chạy cần được lưu vào Git trước khi tái lập qua clone.
-- `requirements.txt` đã có thay đổi cục bộ của người dùng; không được ghi đè để làm sạch Git.
-- Có các script/bảng thống kê và notebook untracked khác; không xóa hoặc gộp vào commit ngoài phạm vi.
-- Cấu hình sau override của notebook: 6 nguồn, `max_samples: 8000` mỗi nguồn, 2 epoch, batch/GPU 2, accumulation 64, LoRA rank 64/alpha 16, NF4 4-bit.
-- Notebook không ghi đè BF16/FP16 nên hiện vẫn kế thừa `bf16: true`, `fp16: false`. Đây chưa phải cấu hình chấp nhận cho profile T4.
-- Notebook còn khai báo `NOTEBOOK_PATH` là v5, chưa nối bước tải checkpoint để resume, và đang tắt tải ảnh test/benchmark.
-- Notebook đang import helper YAML trong kernel Kaggle. Cần chuyển phần này sang Python riêng, không chỉ chuyển lệnh train.
-- Output đã lưu không có bằng chứng cell train của chính file này hoàn tất. Không dùng output cũ để xác nhận phiên bản code hiện tại chạy được.
-- Chưa có kiểm chứng fresh-session Kaggle cho các thay đổi được đề xuất trong tài liệu.
+- Baseline dev_tt đã sửa local: 1 epoch, tối đa 1.000 dòng/nguồn, chia val 10% theo ảnh.
+- Có helper xuất subset/manifest/registry và YAML runtime; chưa tạo subset thật, chưa train A/B.
+- Chưa triển khai cơ chế loss ưu tiên mẫu khó; chưa tạo/push dev-caitien.
+- Chưa kiểm chứng bản hiện tại trên Kaggle; tự động triển khai/chạy/lấy kết quả chưa hoàn tất.
+- Việc tiếp theo: duyệt diff, đưa đủ source lên GitHub khi được giao, rồi chạy baseline Kaggle.
+- File đổi, kiểm thử và giới hạn: [báo cáo baseline](reports/BASELINE_DEV_TT_2026_11_06.md).
 
-## Kết quả cũ có thiếu mẫu không?
+## Lịch sử, không phải kế hoạch hiện hành
 
-Kiểm tra chỉ đọc trong phiên làm việc này đã đối chiếu 24 file dự đoán thuộc 8 nhóm với bộ prompts tại `Uni-MuMER-project`:
+- [Bản hướng dẫn trước khi chốt A/B](archive/2026-11-05-before-ab-plan/INDEX.md).
+- [Các báo cáo kỹ thuật](reports/README.md): chỉ mở báo cáo liên quan khi cần tra cứu.
+- [Ghi nhận nhóm agent](TEAM_EXECUTION_2026_11_05.md).
 
-- `data/CROHME/results` và `results_checkpoint450`.
-- Các nhóm `results_checkpoint450_dagshub`, `700_dagshub`, `736_dagshub`, `800_dagshub`, `844_dagshub` (đều có tiền tố `results_checkpoint`).
-- `_output_/test-unimer/kaggle_test_results`.
-
-Mỗi nhóm có đủ 986 mẫu CROHME 2014, 1.147 mẫu 2016 và 1.199 mẫu 2019, tổng 3.332. Không thiếu/trùng/thừa ID; ground truth khớp; không có dự đoán rỗng; số mẫu trong báo cáo khớp JSON.
-
-Đây là kiểm chứng độ đầy đủ của các file đang lưu, không phải chạy lại model, chứng minh validation không rò rỉ, hay xác nhận toàn bộ phương pháp đánh giá. Không cần chạy lại chỉ vì cảnh báo code có thể bỏ qua ảnh thiếu.
-
-## Trạng thái công việc
-
-- [x] Xác định notebook chính và đọc các script liên quan.
-- [x] Kiểm tra độ đầy đủ của các kết quả cũ nêu trên.
-- [x] Viết quy tắc agent, kế hoạch và checklist Kaggle.
-- [ ] Sửa môi trường/cấu hình và luồng lưu kết quả.
-- [ ] Hoàn thiện checkpoint/resume và kiểm thử không GPU.
-- [ ] Chạy smoke test được cho phép trên Kaggle sạch.
-- [ ] Chuẩn hóa split và đánh giá để làm baseline mới.
-- [ ] Chạy ablation, rồi mới triển khai adaptive sampling.
-
-Chỉ đánh dấu hoàn thành khi có bằng chứng. Mọi lần train dài, cài đặt, tải dữ liệu/model hay thao tác DagsHub phải nằm trong phạm vi được người dùng cho phép.
+Không lấy checklist cũ “khôi phục 700 rồi warm-start” làm việc tiếp theo.
