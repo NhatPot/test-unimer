@@ -55,7 +55,11 @@ class KaggleNotebookTests(unittest.TestCase):
                         and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in n.targets))
         names = ast.literal_eval(settings.values[0]).split(", ")
         prepared = Path(namespace["BASELINE_DATA_ROOT"]) / "n1000-v0.1-s42"
-        prepare_from_rows(prepared, {name:rows() for name in names}, {name:registry[name] for name in names})
+        result = prepare_from_rows(
+            prepared, {name:rows() for name in names}, {name:registry[name] for name in names},
+            revisions={"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]},
+        )
+        namespace["EXPECTED_SPLIT_SHA256"] = result["manifest_sha256"]
         return namespace
 
     def run_runtime(self, namespace):
@@ -165,8 +169,22 @@ class KaggleNotebookTests(unittest.TestCase):
     def test_clone_cell_never_pulls_or_resets_existing_source(self):
         self.assertNotIn("git pull", self.sources[3])
         self.assertNotIn("git reset", self.sources[3])
-        self.assertIn("--branch dev_tt", self.sources[3])
+        self.assertIn("--branch dev-caitien", self.sources[3])
         self.assertIn("branch --show-current", self.sources[3])
+
+    def test_pinned_split_mismatch_blocks_runtime_before_train(self):
+        namespace = self.runtime_namespace()
+        namespace["EXPECTED_SPLIT_SHA256"] = "0" * 64
+        with self.assertRaises(RuntimeError):
+            self.run_runtime(namespace)
+        self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
+
+    def test_cached_dataset_revision_mismatch_is_rejected(self):
+        namespace = self.runtime_namespace()
+        namespace["DATASET_REVISION"] = "0" * 40
+        with self.assertRaises(RuntimeError):
+            self.run_runtime(namespace)
+        self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
 
     def test_project_and_framework_dependencies_resolve_together(self):
         self.assertIn('"$PYTHON" -m pip install -q -r requirements.txt -e train/LLaMA-Factory', self.sources[5])
@@ -210,6 +228,11 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["image_max_pixels"], 262144)
         self.assertEqual(config["cutoff_len"], 2048)
         self.assertFalse(config["overwrite_output_dir"])
+        self.assertTrue(config["use_hard_example_loss"])
+        self.assertEqual(config["hard_example_loss_alpha"], 0.5)
+        self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
+        self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
+        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
     def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
@@ -291,7 +314,7 @@ class KaggleNotebookTests(unittest.TestCase):
     def test_no_shared_benchmark_upload_or_new_pipeline_claim(self):
         self.assertNotIn("mlflow.start_run", self.sources[10])
         self.assertNotIn("kaggle_test_results", self.sources[10])
-        self.assertIn("không dùng checkpoint 700", self.sources[0])
+        self.assertIn("không dùng checkpoint cũ", self.sources[0])
         self.assertIn("wrapper cũ", self.sources[8])
         for index in (4, 9, 11):
             self.assertTrue(self.sources[index].startswith("# %%bash"))

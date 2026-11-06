@@ -174,7 +174,8 @@ def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
         lock.rmdir()  # Failed partial builds are preserved for diagnosis.
 
 
-def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val_ratio=0.1, seed=42):
+def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val_ratio=0.1, seed=42,
+                     dataset_revision=None):
     names = [name.strip() for name in datasets.split(",") if name.strip()]
     settings = _settings(names, max_samples, val_ratio, seed)
     registry = json.loads((Path(project_dir) / "train/dataset_info.json").read_text(encoding="utf-8"))
@@ -183,10 +184,16 @@ def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val
     output_dir = require_regular_path(Path(output_dir))
     cached = reuse_prepared(output_dir, settings)
     if cached:
+        if dataset_revision is not None:
+            manifest = json.loads((output_dir / "split_manifest.json").read_text(encoding="utf-8"))
+            expected = {entry["hf_hub_url"]: dataset_revision for entry in entries.values()}
+            if manifest.get("source_revisions") != expected:
+                raise ValueError("Cached dataset revision differs from the requested baseline revision")
         return cached
     from datasets import load_dataset_builder
     from huggingface_hub import HfApi
-    revisions = {repo: HfApi().dataset_info(repo).sha for repo in {e["hf_hub_url"] for e in entries.values()}}
+    revisions = {repo: HfApi().dataset_info(repo, revision=dataset_revision).sha
+                 for repo in {e["hf_hub_url"] for e in entries.values()}}
     with ExitStack() as readers:
         rows = {}
         for name, entry in entries.items():
@@ -229,6 +236,8 @@ def main(argv=None):
     parser.add_argument("--max-samples", type=int, default=1000)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-revision")
+    parser.add_argument("--expected-manifest-sha256")
     parser.add_argument("--base-yaml")
     parser.add_argument("--runtime-yaml")
     parser.add_argument("--overrides-json")
@@ -246,7 +255,10 @@ def main(argv=None):
     result = prepare_baseline(args.project_dir, names, args.output_dir,
                               max_samples=overrides.get("max_samples", 1000) if overrides else args.max_samples,
                               val_ratio=overrides.get("val_size", .1) if overrides else args.val_ratio,
-                              seed=overrides.get("seed", 42) if overrides else args.seed)
+                              seed=overrides.get("seed", 42) if overrides else args.seed,
+                              dataset_revision=args.dataset_revision)
+    if args.expected_manifest_sha256 and result["manifest_sha256"] != args.expected_manifest_sha256:
+        raise ValueError("Split manifest differs from baseline; training configuration was not published")
     if overrides is not None:
         from scripts.runtime_yaml import prepare_runtime_yaml
         # max_samples/val_size are input subset controls, not a second loader split/cap.
@@ -265,7 +277,9 @@ def main(argv=None):
                         "num_train_epochs", "max_samples", "max_steps", "seed",
                         "per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate",
                         "lora_rank", "lora_alpha", "quantization_bit", "bf16", "fp16",
-                        "save_steps", "eval_steps", "load_best_model_at_end", "resume_from_checkpoint")
+                        "save_steps", "eval_steps", "load_best_model_at_end", "resume_from_checkpoint",
+                        "model_revision", "use_hard_example_loss", "hard_example_loss_alpha",
+                        "hard_example_loss_max_weight")
         result.update(yaml_config=str((Path(args.project_dir) / config).resolve()),
                       output_dir=str((Path(args.project_dir) / output).resolve()),
                       summary={k:resolved.get(k) for k in summary_keys})

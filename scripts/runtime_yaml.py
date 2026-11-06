@@ -19,6 +19,7 @@ import yaml
 # Explicit additions needed by bounded smoke runs and separate validation splits.
 EXTRA_OVERRIDE_KEYS = frozenset({
     "max_steps", "seed", "data_seed", "eval_dataset", "adapter_name_or_path", "create_new_adapter",
+    "model_revision", "use_hard_example_loss", "hard_example_loss_alpha", "hard_example_loss_max_weight",
 })
 
 
@@ -226,7 +227,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate",
                     "lora_rank", "lora_alpha", "quantization_bit", "quantization_type",
                     "bf16", "fp16", "save_steps", "eval_steps", "output_dir",
-                    "resume_from_checkpoint", "adapter_name_or_path")
+                    "resume_from_checkpoint", "adapter_name_or_path", "model_revision",
+                    "use_hard_example_loss", "hard_example_loss_alpha", "hard_example_loss_max_weight")
             payload["summary"] = {key: resolved.get(key) for key in keys}
         print(json.dumps(payload))
     except (json.JSONDecodeError, yaml.YAMLError):

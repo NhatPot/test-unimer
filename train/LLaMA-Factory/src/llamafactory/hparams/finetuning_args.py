@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
@@ -490,6 +491,18 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether to use the DFT loss."},
     )
+    use_hard_example_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use hard-example-weighted cross-entropy loss in SFT training."},
+    )
+    hard_example_loss_alpha: float = field(
+        default=0.5,
+        metadata={"help": "Scaling factor alpha (>= 0) for excess relative difficulty in hard-example loss."},
+    )
+    hard_example_loss_max_weight: float = field(
+        default=1.5,
+        metadata={"help": "Maximum per-example loss weight cap (>= 1) in hard-example loss."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -579,6 +592,35 @@ class FinetuningArguments(
 
             if self.pissa_init:
                 raise ValueError("`pissa_init` is only valid for LoRA training.")
+
+        if not isinstance(self.use_hard_example_loss, bool):
+            raise ValueError("`use_hard_example_loss` must be a boolean.")
+
+        if (
+            isinstance(self.hard_example_loss_alpha, bool)
+            or not isinstance(self.hard_example_loss_alpha, (int, float))
+            or not math.isfinite(self.hard_example_loss_alpha)
+            or self.hard_example_loss_alpha < 0.0
+        ):
+            raise ValueError("`hard_example_loss_alpha` must be a finite number >= 0.0.")
+
+        if (
+            isinstance(self.hard_example_loss_max_weight, bool)
+            or not isinstance(self.hard_example_loss_max_weight, (int, float))
+            or not math.isfinite(self.hard_example_loss_max_weight)
+            or self.hard_example_loss_max_weight < 1.0
+        ):
+            raise ValueError("`hard_example_loss_max_weight` must be a finite number >= 1.0.")
+
+        self.hard_example_loss_alpha = float(self.hard_example_loss_alpha)
+        self.hard_example_loss_max_weight = float(self.hard_example_loss_max_weight)
+
+        if self.use_hard_example_loss:
+            if self.stage != "sft":
+                raise ValueError("`use_hard_example_loss` is only valid for SFT training stage.")
+
+            if self.use_dft_loss:
+                raise ValueError("Cannot use `use_hard_example_loss` and `use_dft_loss` together.")
 
     def to_dict(self) -> dict[str, Any]:
         args = asdict(self)

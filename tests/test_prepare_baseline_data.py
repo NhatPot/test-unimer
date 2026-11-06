@@ -5,11 +5,12 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from contextlib import closing
 
 from PIL import Image
 
-from scripts.prepare_baseline_data import prepare_from_rows, reuse_prepared, _settings, _parquet_rows
+from scripts.prepare_baseline_data import prepare_baseline, prepare_from_rows, reuse_prepared, _settings, _parquet_rows
 
 
 def image_bytes(index, format="PNG"):
@@ -197,6 +198,25 @@ class BaselineDataTests(unittest.TestCase):
         with closing(_parquet_rows([path], ["conversations", "image"], 2)) as stream:
             with self.assertRaises(ValueError):
                 next(stream)
+
+    def test_requested_dataset_revision_is_used_for_all_remote_loads(self):
+        project = self.root / "project"
+        (project / "train").mkdir(parents=True)
+        (project / "train/dataset_info.json").write_text(json.dumps(self.entries))
+        revision = "a" * 40
+        builder = mock.Mock()
+        builder.info.builder_name = "parquet"
+        builder.config.data_files = {"train": ["fixture.parquet"]}
+        with mock.patch("huggingface_hub.HfApi") as api, \
+                mock.patch("datasets.load_dataset_builder", return_value=builder) as load, \
+                mock.patch("scripts.prepare_baseline_data._parquet_rows", side_effect=lambda *a: (r for r in rows())):
+            api.return_value.dataset_info.return_value.sha = revision
+            result = prepare_baseline(project, "hmer,count", self.output, dataset_revision=revision)
+        api.return_value.dataset_info.assert_called_once_with("fixture/repo", revision=revision)
+        self.assertEqual(load.call_count, 2)
+        self.assertTrue(all(call.kwargs["revision"] == revision for call in load.call_args_list))
+        self.assertEqual(json.loads(Path(result["manifest_path"]).read_text())["source_revisions"],
+                         {"fixture/repo": revision})
 
 
 if __name__ == "__main__":

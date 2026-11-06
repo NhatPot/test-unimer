@@ -3,8 +3,14 @@
 Cập nhật 2026-11-06. Áp dụng cho Codex, subagent và Antigravity.
 Đọc file này; chỉ mở thêm tài liệu đúng nhiệm vụ. Không bắt đầu từ kế hoạch cũ.
 
-Trước mắt CHỈ chuẩn bị baseline trên dev_tt. main là lịch sử; dev-caitien và
-weighted loss để sau khi baseline có kết quả. Không triển khai hai nhánh cùng lúc.
+Phạm vi mới được chủ project giao: triển khai B trên nhánh dev-caitien từ commit
+baseline 0f65e4cc4c67b042998b84c5ac068abeeca09719. Không sửa checkout dev_tt.
+Baseline đã hoàn tất: MLflow 3aaa5b8d882f4555a17d2c139e38513c, 5411 train/589 val,
+1 epoch/22 global steps; final val loss 0.5565038323402405. Nhánh này là pilot
+weighted loss, không phải backbone mới. Không resume checkpoint 700 hoặc 22.
+Đọc hướng dẫn mới này thay phần trạng thái baseline cũ trong IMPLEMENTATION_PLAN.md.
+Coordinator phụ trách notebook, GitHub và Kaggle. Worker chỉ sửa các file được giao;
+không tự push, cài package, mở GPU hay sửa notebook. Không đổi dependency baseline.
 
 ## Mục tiêu hiện tại
 
@@ -66,13 +72,14 @@ Cell 5 (Thông số baseline) là nơi chỉnh mẫu/epoch/val; helper chuẩn b
 xuất YAML runtime, không cap/chia lần hai. Đã thử draft Kaggle 2 dòng/nguồn và
 1 optimizer step thành công. Đã kiểm chứng thêm train/val/checkpoint/upload DagsHub
 và tải adapter về local khớp SHA256 ở run 79065aa1f6d34262a90122f7f7b25060.
-CHƯA chạy baseline 1.000 dòng/nguồn hoặc inference/benchmark local cho run này.
+ĐÃ chạy baseline 1.000 dòng/nguồn; CHƯA inference/benchmark local.
 Helper đọc ParquetFile theo batch và đóng reader rõ ràng để tránh lỗi thoát Python.
 Train theo epoch phải dùng max_steps=-1, KHÔNG ghi null (Trainer so sánh với số 0).
-Nhánh dev-caitien chưa tạo. Chi tiết: docs/reports/BASELINE_DEV_TT_2026_11_06.md.
+Nhánh dev-caitien đã tạo trong checkout riêng. Bằng chứng baseline chỉ đọc:
+/home/nhat/Uni-MuMER-project/data/dagshub_downloads/3aaa5b8d882f4555a17d2c139e38513c/validation_review/.
 Các thư viện sync/timeout mới chưa nối đầy đủ vào đường chạy notebook.
-Việc tiếp theo là duyệt diff, chốt source GitHub, rồi chuẩn bị dữ liệu thật và chạy baseline
-trên Kaggle khi được giao. RUN_TRAINING mặc định False; không tự bật để kiểm thử local.
+Việc tiếp theo là code và kiểm thử loss cải tiến, rồi coordinator triển khai Kaggle.
+RUN_TRAINING mặc định False; không tự bật để kiểm thử local. Validation vẫn loss chuẩn.
 Checkpoint 700 chỉ là kết quả lịch sử, KHÔNG phải điều kiện chặn thí nghiệm mới.
 docs/archive/ và docs/reports/ là snapshot tham khảo, không phải lệnh thực thi.
 Nếu tài liệu cũ mâu thuẫn, theo file này và IMPLEMENTATION_PLAN.md hiện tại.

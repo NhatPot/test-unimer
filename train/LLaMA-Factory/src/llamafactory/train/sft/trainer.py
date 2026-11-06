@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping, MutableMapping
 import json
 import os
 from types import MethodType
@@ -31,6 +32,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+from .hard_example_loss import compute_hard_example_weighted_loss, validate_hard_example_loss_config
 
 
 if TYPE_CHECKING:
@@ -63,13 +65,26 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
 
+        self.finetuning_args = finetuning_args
+        self.model_args = model_args
+        if getattr(finetuning_args, "use_hard_example_loss", False):
+            self._validate_hard_example_loss_setup(
+                training_args=kwargs.get("args"),
+                compute_loss_func=kwargs.get("compute_loss_func"),
+            )
+
         super().__init__(**kwargs)
         if processor is not None:
             # avoid wrong loss under gradient accumulation
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
 
-        self.finetuning_args = finetuning_args
+        self._super_model_accepts_loss_kwargs = self.model_accepts_loss_kwargs
+        if getattr(finetuning_args, "use_hard_example_loss", False):
+            # Hard-example loss is normalized by the microbatch weighted token count,
+            # so Trainer.training_step must divide by gradient_accumulation_steps once.
+            self.model_accepts_loss_kwargs = False
+
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -88,9 +103,53 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.compute_loss_func = dft_loss_func
 
+        if getattr(finetuning_args, "use_hard_example_loss", False):
+            self._validate_hard_example_loss_setup()
+
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
+
+    def _validate_hard_example_loss_setup(
+        self,
+        training_args: Optional[Any] = None,
+        compute_loss_func: Optional[Any] = None,
+    ) -> None:
+        r"""Reject configuration or trainer states incompatible with hard-example weighted loss."""
+        if not getattr(self.finetuning_args, "use_hard_example_loss", False):
+            return
+
+        if not isinstance(self.finetuning_args.use_hard_example_loss, bool):
+            raise ValueError("`use_hard_example_loss` must be a boolean.")
+
+        validate_hard_example_loss_config(
+            alpha=getattr(self.finetuning_args, "hard_example_loss_alpha", 0.5),
+            max_weight=getattr(self.finetuning_args, "hard_example_loss_max_weight", 1.5),
+        )
+
+        if getattr(self.finetuning_args, "stage", "sft") != "sft":
+            raise ValueError("`use_hard_example_loss` is only valid for SFT training stage.")
+
+        if getattr(self.finetuning_args, "use_dft_loss", False):
+            raise ValueError("Cannot use `use_hard_example_loss` and `use_dft_loss` together.")
+
+        active_args = training_args if training_args is not None else getattr(self, "args", None)
+        active_loss_func = (
+            compute_loss_func if compute_loss_func is not None else getattr(self, "compute_loss_func", None)
+        )
+
+        if active_loss_func is not None:
+            raise ValueError("Cannot use `use_hard_example_loss` with a custom `compute_loss_func`.")
+
+        if getattr(self, "label_smoother", None) is not None or (
+            active_args is not None and getattr(active_args, "label_smoothing_factor", 0.0) != 0
+        ):
+            raise ValueError("Cannot use `use_hard_example_loss` with label smoothing.")
+
+        if (self.model_args is not None and getattr(self.model_args, "enable_liger_kernel", False)) or (
+            active_args is not None and getattr(active_args, "use_liger_kernel", False)
+        ):
+            raise ValueError("Cannot use `use_hard_example_loss` with liger kernel.")
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -113,8 +172,78 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(
+        self,
+        model: "torch.nn.Module",
+        inputs: dict[str, Union["torch.Tensor", Any]],
+        return_outputs: bool = False,
+        num_items_in_batch: Optional["torch.Tensor"] = None,
+        *args,
+        **kwargs,
+    ):
+        if not getattr(self.finetuning_args, "use_hard_example_loss", False):
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch, *args, **kwargs
+            )
+
+        if not model.training:
+            prev_accepts = self.model_accepts_loss_kwargs
+            self.model_accepts_loss_kwargs = getattr(self, "_super_model_accepts_loss_kwargs", prev_accepts)
+            try:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                self.model_accepts_loss_kwargs = prev_accepts
+
+        self._validate_hard_example_loss_setup()
+        if not isinstance(inputs, Mapping) or "labels" not in inputs or inputs["labels"] is None:
+            raise ValueError("`use_hard_example_loss` requires `labels` in `inputs` during training.")
+
+        labels = inputs["labels"]
+        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
+        outputs = model(**model_inputs)
+
+        if isinstance(outputs, Mapping):
+            logits = outputs.get("logits")
+        elif hasattr(outputs, "logits"):
+            logits = outputs.logits
+        elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+            logits = outputs[0]
+        else:
+            logits = None
+
+        if logits is None:
+            raise ValueError(
+                "`use_hard_example_loss` requires model outputs to include `logits` "
+                "(incompatible with fused loss kernels that omit logits)."
+            )
+
+        loss = compute_hard_example_weighted_loss(
+            logits=logits,
+            labels=labels,
+            alpha=self.finetuning_args.hard_example_loss_alpha,
+            max_weight=self.finetuning_args.hard_example_loss_max_weight,
+            ignore_index=IGNORE_INDEX,
+        )
+
+        if return_outputs or self.args.past_index >= 0:
+            if isinstance(outputs, MutableMapping):
+                outputs["loss"] = loss
+                if hasattr(outputs, "move_to_end"):
+                    outputs.move_to_end("loss", last=False)
+            elif isinstance(outputs, tuple):
+                outputs = (loss,) + outputs
+
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        return (loss, outputs) if return_outputs else loss
 
     @override
     def prediction_step(
