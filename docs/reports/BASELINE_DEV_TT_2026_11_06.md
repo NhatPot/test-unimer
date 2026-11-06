@@ -55,3 +55,25 @@ chưa remote-verified. Không nối toàn bộ thư viện sync/timeout mới v�
 
 Bước tiếp: duyệt diff -> commit/push đúng file được giao -> backup Kaggle ->
 chạy baseline từ source đó -> kiểm tra actual split, validation, checkpoint và run DagsHub.
+
+## Sửa dependency sau Version 12
+
+Version 12 (scriptVersionId 366053614) dừng trước train sau 749,7 giây ở cell cài
+thư viện: pip check báo Prometheus 8.1.0 cần Starlette >=1 nhưng bản cài là 0.52.1,
+và decord 0.6.0 không được hỗ trợ theo kiểm tra platform của pip. Không suy ra
+đây là lỗi CUDA hay thư viện có sẵn trong kernel Kaggle.
+
+- `requirements.txt`: giữ vllm 0.8.5, thêm Prometheus 7.1.0 (chấp nhận Starlette
+  >=0.30,<1); đổi qwen-vl-utils[decord] thành qwen-vl-utils cùng version 0.0.11.
+  Baseline ảnh không cần extra đọc video decord; không tuyên bố sửa hỗ trợ video.
+- Cell cài dependency: dùng một lệnh pip với cả `-r requirements.txt` và
+  `-e train/LLaMA-Factory` để resolver xét hai bộ yêu cầu cùng lúc. Giữ pip check,
+  Python riêng và thông số train; không sửa framework vendored hoặc YAML.
+- Thêm hai test chống tách lệnh cài/bỏ kiểm tra và chống dependency drift.
+  253 CPU tests, notebook Python/Bash syntax và git diff check đạt.
+- Đã đối chiếu metadata chính thức:
+  [Prometheus 7.1.0](https://pypi.org/pypi/prometheus-fastapi-instrumentator/7.1.0/json),
+  [Gradio 5.45.0](https://pypi.org/pypi/gradio/5.45.0/json),
+  [Qwen VL Utils 0.0.11](https://pypi.org/pypi/qwen-vl-utils/0.0.11/json).
+- Bản sửa dependency mới chỉ ở local dev_tt, chưa push/upload hoặc chạy lại Kaggle.
+  Test CPU/metadata không thay thế kiểm chứng cài toàn bộ dependency trên Kaggle.

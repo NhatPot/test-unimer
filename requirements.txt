@@ -6,8 +6,11 @@ peft==0.15.2
 datasets==3.2.0
 bitsandbytes>=0.41.0
 
-qwen-vl-utils[decord]==0.0.11
+# Image baseline does not need the optional decord video backend.
+qwen-vl-utils==0.0.11
 vllm==0.8.5
+# vLLM allows >=7; 8.x needs Starlette >=1, unlike the bundled Gradio stack.
+prometheus-fastapi-instrumentator==7.1.0
 numpy==1.26.4
 opencv-python-headless==4.11.0.86
 editdistance==0.8.1

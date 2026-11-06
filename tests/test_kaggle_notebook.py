@@ -168,6 +168,22 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIn("--branch dev_tt", self.sources[3])
         self.assertIn("branch --show-current", self.sources[3])
 
+    def test_project_and_framework_dependencies_resolve_together(self):
+        self.assertIn('"$PYTHON" -m pip install -q -r requirements.txt -e train/LLaMA-Factory', self.sources[5])
+        self.assertEqual(self.sources[5].count("-m pip install"), 1)
+        self.assertIn('"$PYTHON" -m pip check', self.sources[5])
+
+    def test_image_baseline_avoids_decord_and_prometheus_major_drift(self):
+        from packaging.requirements import Requirement
+        requirements = [Requirement(line) for line in (ROOT / "requirements.txt").read_text().splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")]
+        packages = {r.name: r for r in requirements}
+        self.assertEqual(packages["qwen-vl-utils"].extras, set())
+        self.assertNotIn("decord", packages)
+        instrumentator = packages["prometheus-fastapi-instrumentator"].specifier
+        self.assertIn("7.1.0", instrumentator)
+        self.assertNotIn("8.1.0", instrumentator)
+
     def test_runtime_real_cli_isolated_python_and_t4_values(self):
         namespace = self.runtime_namespace()
         env = self.run_runtime(namespace)
