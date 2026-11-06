@@ -104,3 +104,31 @@ Phần này cập nhật trạng thái mới hơn các ghi nhận trước ở t
   Uni-MuMER-project, file kaggle-draft-one-step-passed.ipynb và DRAFT_SMOKE.md.
 - Còn chưa kiểm chứng: baseline lớn hơn, validation trong run train đầy đủ,
   checkpoint sync/resume và upload DagsHub. Không tuyên bố end-to-end hoàn tất.
+
+## Pipeline Đến DagsHub Và Tải Về Local
+
+Kết quả mới hơn các ghi nhận trước, giới hạn đúng yêu cầu kiểm tra 1 bước:
+
+- Sửa thêm max_steps từ null sang -1 ở helper (commit `19657be`), giữ train theo
+  epoch. Smoke đặt max_steps=1 trước đó từng che lỗi kiểu dữ liệu này; đã thêm
+  test reset giới hạn cũ về mặc định số nguyên. Tổng 257 CPU tests đạt.
+- Dataset 2 dòng/nguồn, 10 train/2 val; train thật đúng 1 optimizer step trên 2 T4,
+  validation và checkpoint-1 đều qua. Trainer train_runtime=14.7986 giây,
+  eval_loss=2.8194668292999268. Chỉ kiểm tra kỹ thuật, không kết luận chất lượng.
+- Run UUID `2368592142f3440e99dc60f614b9e2a0`, actual MLflow run ID
+  `79065aa1f6d34262a90122f7f7b25060`, nhãn pipeline_check, source `19657be`.
+- Wrapper gửi checkpoint đầy đủ; final logger xác minh 51 file remote theo kích
+  thước (sizes_only). Không tuyên bố tất cả 51 file đã kiểm tra SHA256 remote.
+- Đã đăng nhập DagsHub trong Orca và tải TRỰC TIẾP 4 file về máy nhà: adapter weights
+  657478696 byte, adapter_config.json, trainer_state.json, run_metadata.json.
+  Cả 4 khớp size/SHA256 trong manifest, đúng run ID và global_step=1.
+- Local: `/home/nhat/Uni-MuMER-project/data/dagshub_downloads/79065aa1f6d34262a90122f7f7b25060/`.
+  Có verification_receipt.json; checkpoint-1 là adapter để inference, không phải
+  bản full-resume local vì không tải optimizer/scheduler/RNG. Không chạy inference.
+- [Mở đúng run DagsHub](https://dagshub.com/NhatPot/test-unimer/experiments#/experiment/m_79065aa1f6d34262a90122f7f7b25060).
+- Backup notebook có output: kaggle-pipeline-dagshub-passed.ipynb trong thư mục
+  kaggle_backups/2026-11-06-baseline-001 của repo local Uni-MuMER-project.
+- Đã khôi phục draft về 1.000 dòng/nguồn, lịch eval/save 5 step, RUN_TRAINING=False
+  và clear outputs sau backup. Không Save Version/Save & Run All mới.
+- Chưa kiểm chứng full baseline 1.000 dòng/nguồn, resume hoặc inference/benchmark
+  trên RTX 3070. Không mở rộng kết luận từ run 1 bước sang các phần đó.

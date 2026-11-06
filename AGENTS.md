@@ -64,8 +64,11 @@ weighted loss để sau khi baseline có kết quả. Không triển khai hai nh
 Notebook local đã cấu hình baseline 1 epoch, 1.000 dòng/nguồn và val 10% theo nhóm ảnh.
 Cell 5 (Thông số baseline) là nơi chỉnh mẫu/epoch/val; helper chuẩn bị subset rồi
 xuất YAML runtime, không cap/chia lần hai. Đã thử draft Kaggle 2 dòng/nguồn và
-1 optimizer step thành công; CHƯA chạy baseline 1.000 dòng/nguồn hoặc thử upload.
+1 optimizer step thành công. Đã kiểm chứng thêm train/val/checkpoint/upload DagsHub
+và tải adapter về local khớp SHA256 ở run 79065aa1f6d34262a90122f7f7b25060.
+CHƯA chạy baseline 1.000 dòng/nguồn hoặc inference/benchmark local cho run này.
 Helper đọc ParquetFile theo batch và đóng reader rõ ràng để tránh lỗi thoát Python.
+Train theo epoch phải dùng max_steps=-1, KHÔNG ghi null (Trainer so sánh với số 0).
 Nhánh dev-caitien chưa tạo. Chi tiết: docs/reports/BASELINE_DEV_TT_2026_11_06.md.
 Các thư viện sync/timeout mới chưa nối đầy đủ vào đường chạy notebook.
 Việc tiếp theo là duyệt diff, chốt source GitHub, rồi chuẩn bị dữ liệu thật và chạy baseline
