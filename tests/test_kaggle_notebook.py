@@ -197,7 +197,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["dataset"], "baseline_train")
         self.assertIsNone(config["resume_from_checkpoint"])
         self.assertIsNone(config["adapter_name_or_path"])
-        self.assertIsNone(config["max_steps"])
+        self.assertEqual(config["max_steps"], -1)  # Trainer compares this integer with zero.
         self.assertTrue(config["create_new_adapter"])
         self.assertFalse(config["load_best_model_at_end"])
         self.assertEqual(config["eval_steps"], 5)
@@ -211,6 +211,18 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["cutoff_len"], 2048)
         self.assertFalse(config["overwrite_output_dir"])
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
+
+    def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
+        namespace = self.runtime_namespace()
+        path = Path(namespace["PROJECT_DIR"]) / namespace["BASE_YAML_CONFIG"]
+        config = yaml.safe_load(path.read_text())
+        config["max_steps"] = 700
+        path.write_text(yaml.safe_dump(config))
+        env = self.run_runtime(namespace)
+        actual = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
+        self.assertIs(type(actual["max_steps"]), int)
+        self.assertEqual(actual["max_steps"], -1)
+        self.assertEqual(actual["num_train_epochs"], 1)
 
     def test_same_runtime_rerun_is_idempotent(self):
         namespace = self.runtime_namespace()

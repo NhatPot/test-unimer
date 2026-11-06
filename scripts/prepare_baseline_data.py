@@ -252,14 +252,14 @@ def main(argv=None):
         # max_samples/val_size are input subset controls, not a second loader split/cap.
         overrides.update(dataset_dir=result["dataset_dir"], dataset=result["train_dataset"],
                          eval_dataset=result["eval_dataset"], val_size=0, max_samples=None,
-                         resume_from_checkpoint=None, adapter_name_or_path=None, max_steps=None,
+                         resume_from_checkpoint=None, adapter_name_or_path=None, max_steps=-1,
                          create_new_adapter=True)
         import contextlib
         import sys
         with contextlib.redirect_stdout(sys.stderr):
             config, output, resolved = prepare_runtime_yaml(
                 args.project_dir, args.base_yaml, args.runtime_yaml, overrides=overrides,
-                clear_keys=["max_samples", "max_steps", "resume_from_checkpoint", "adapter_name_or_path"],
+                clear_keys=["max_samples", "resume_from_checkpoint", "adapter_name_or_path"],
                 profile="t4", overwrite=True)
         summary_keys = ("model_name_or_path", "dataset", "eval_dataset", "dataset_dir", "val_size",
                         "num_train_epochs", "max_samples", "max_steps", "seed",
