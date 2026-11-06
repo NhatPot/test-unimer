@@ -2,11 +2,14 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
+from contextlib import closing
 
 from PIL import Image
 
-from scripts.prepare_baseline_data import prepare_from_rows, reuse_prepared, _settings
+from scripts.prepare_baseline_data import prepare_from_rows, reuse_prepared, _settings, _parquet_rows
 
 
 def image_bytes(index, format="PNG"):
@@ -159,6 +162,41 @@ class BaselineDataTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self.prepare()
         self.assertFalse(self.output.exists())
+
+    def test_parquet_prefix_preserves_rows_and_stops_before_next_file(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        path = self.root / "source.parquet"
+        pq.write_table(pa.Table.from_pylist(rows()), path, row_group_size=10)
+        with closing(_parquet_rows([path, self.root / "must-not-open.parquet"],
+                                   ["conversations", "image"], 2)) as stream:
+            selected = list(stream)
+        self.assertEqual([r["id"] for r in selected], ["0", "1"])
+        self.assertEqual(selected[0]["image"]["bytes"], image_bytes(0))
+
+    def test_parquet_early_stop_exits_cleanly_in_fresh_processes(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        path = self.root / "source.parquet"
+        pq.write_table(pa.Table.from_pylist(rows()), path, row_group_size=10)
+        code = ("from contextlib import closing; from itertools import islice; "
+                "from scripts.prepare_baseline_data import _parquet_rows; "
+                f"stream=_parquet_rows([{str(path)!r}], ['conversations','image'], 2); "
+                "\nwith closing(stream): assert len(list(islice(stream, 2))) == 2\n")
+        for _ in range(3):
+            result = subprocess.run([sys.executable, "-B", "-c", code],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Fatal Python error", result.stderr)
+
+    def test_parquet_missing_required_columns_is_not_silently_dropped(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        path = self.root / "bad.parquet"
+        pq.write_table(pa.table({"id": ["0"]}), path)
+        with closing(_parquet_rows([path], ["conversations", "image"], 2)) as stream:
+            with self.assertRaises(ValueError):
+                next(stream)
 
 
 if __name__ == "__main__":

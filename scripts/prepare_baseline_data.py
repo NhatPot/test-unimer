@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import ExitStack, closing
 import hashlib
 import io
 from itertools import islice
@@ -183,16 +184,41 @@ def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val
     cached = reuse_prepared(output_dir, settings)
     if cached:
         return cached
-    from datasets import Image, load_dataset
+    from datasets import load_dataset_builder
     from huggingface_hub import HfApi
     revisions = {repo: HfApi().dataset_info(repo).sha for repo in {e["hf_hub_url"] for e in entries.values()}}
-    rows = {}
-    for name, entry in entries.items():
-        dataset = load_dataset(entry["hf_hub_url"], entry["subset"], split=entry.get("split", "train"),
-                               revision=revisions[entry["hf_hub_url"]], streaming=True)
-        rows[name] = dataset.cast_column(entry["columns"]["images"], Image(decode=False))
-    return prepare_from_rows(output_dir, rows, entries, max_samples=max_samples,
-                             val_ratio=val_ratio, seed=seed, revisions=revisions)
+    with ExitStack() as readers:
+        rows = {}
+        for name, entry in entries.items():
+            builder = load_dataset_builder(entry["hf_hub_url"], entry["subset"],
+                                           revision=revisions[entry["hf_hub_url"]])
+            if builder.info.builder_name != "parquet":
+                raise ValueError("Baseline preparation requires Parquet sources")
+            files = builder.config.data_files[entry.get("split", "train")]
+            columns = [entry["columns"]["messages"], entry["columns"]["images"]]
+            rows[name] = readers.enter_context(closing(_parquet_rows(files, columns, max_samples)))
+        return prepare_from_rows(output_dir, rows, entries, max_samples=max_samples,
+                                 val_ratio=val_ratio, seed=seed, revisions=revisions)
+
+
+def _parquet_rows(files, columns, limit):
+    """Avoid Arrow Dataset fragment readers surviving an early streaming stop."""
+    import fsspec
+    import pyarrow.parquet as pq
+
+    remaining = limit
+    for name in files:
+        with fsspec.open(str(name), "rb") as stream, closing(pq.ParquetFile(stream)) as parquet:
+            missing = set(columns) - set(parquet.schema_arrow.names)
+            if missing:
+                raise ValueError("Parquet source is missing required image/message columns")
+            selected = columns + (["id"] if "id" in parquet.schema_arrow.names else [])
+            for batch in parquet.iter_batches(batch_size=min(32, limit), columns=selected, use_threads=False):
+                for row in batch.to_pylist():
+                    yield row
+                    remaining -= 1
+                    if not remaining:
+                        return
 
 
 def main(argv=None):
