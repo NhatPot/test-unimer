@@ -63,7 +63,9 @@ weighted loss để sau khi baseline có kết quả. Không triển khai hai nh
 
 Notebook local đã cấu hình baseline 1 epoch, 1.000 dòng/nguồn và val 10% theo nhóm ảnh.
 Cell 5 (Thông số baseline) là nơi chỉnh mẫu/epoch/val; helper chuẩn bị subset rồi
-xuất YAML runtime, không cap/chia lần hai. Chưa tạo subset thật hoặc chạy Kaggle.
+xuất YAML runtime, không cap/chia lần hai. Đã thử draft Kaggle 2 dòng/nguồn và
+1 optimizer step thành công; CHƯA chạy baseline 1.000 dòng/nguồn hoặc thử upload.
+Helper đọc ParquetFile theo batch và đóng reader rõ ràng để tránh lỗi thoát Python.
 Nhánh dev-caitien chưa tạo. Chi tiết: docs/reports/BASELINE_DEV_TT_2026_11_06.md.
 Các thư viện sync/timeout mới chưa nối đầy đủ vào đường chạy notebook.
 Việc tiếp theo là duyệt diff, chốt source GitHub, rồi chuẩn bị dữ liệu thật và chạy baseline

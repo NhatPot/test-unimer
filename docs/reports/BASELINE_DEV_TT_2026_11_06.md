@@ -77,3 +77,30 @@ và decord 0.6.0 không được hỗ trợ theo kiểm tra platform của pip. 
   [Qwen VL Utils 0.0.11](https://pypi.org/pypi/qwen-vl-utils/0.0.11/json).
 - Bản sửa dependency mới chỉ ở local dev_tt, chưa push/upload hoặc chạy lại Kaggle.
   Test CPU/metadata không thay thế kiểm chứng cài toàn bộ dependency trên Kaggle.
+
+## Kết quả thử draft và sửa reader
+
+Phần này cập nhật trạng thái mới hơn các ghi nhận trước ở trên:
+
+- `8734ab0` đã push dev_tt; cài sạch trên Kaggle đạt pip check, nhận đủ 2 Tesla T4.
+- Tạo subset bằng datasets streaming cũ ghi được file nhưng crash lúc Python
+  finalizing (`PyGILState_Release`, exit -6). Không bỏ qua lỗi hoặc dùng cache để che.
+- `19d2836` đổi riêng helper sang ParquetFile.iter_batches(use_threads=False),
+  giới hạn đọc và đóng generator/file bằng context manager. Giữ datasets 3.2.0,
+  không monkey-patch thư viện cài đặt hay đổi model/hyperparameter.
+- 256 test CPU đạt, có subprocess thoát sạch sau dừng đọc sớm.
+- Hai lần tạo subset THẬT ở hai thư mục mới trên Kaggle đều thành công:
+  10 train/2 val, 8 ảnh, 7 nhóm train/1 val, giao nhóm ảnh bằng 0.
+- Draft train 1 optimizer step thành công trên 2 T4, FP16/NF4/LoRA, 10 dòng train.
+  Trainer báo train_runtime=6.303 giây, train_loss=0.0636883; đây là smoke kỹ thuật,
+  KHÔNG phải metric chất lượng hoặc bằng chứng cải thiện (1 bước có warmup).
+- Test dùng YAML riêng để chuỗi "no" không bị CLI/OmegaConf hiểu thành boolean.
+  Không sửa parser framework hoặc mang lệnh smoke vào baseline.
+- Không Save Version/Save & Run All mới, không upload DagsHub. Trainer vẫn tự lưu
+  adapter cuối ở working/smoke-one-step; giữ riêng, không dùng làm khởi tạo baseline.
+- Đã export notebook kết quả rồi khôi phục draft về source baseline: 1.000 dòng/nguồn,
+  wrapper chuẩn, RUN_TRAINING=False; xóa cell chẩn đoán/lệnh smoke và clear outputs.
+- Bằng chứng local: data/kaggle_backups/2026-11-06-baseline-001/ ở repo
+  Uni-MuMER-project, file kaggle-draft-one-step-passed.ipynb và DRAFT_SMOKE.md.
+- Còn chưa kiểm chứng: baseline lớn hơn, validation trong run train đầy đủ,
+  checkpoint sync/resume và upload DagsHub. Không tuyên bố end-to-end hoàn tất.
