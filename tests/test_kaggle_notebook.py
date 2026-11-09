@@ -210,7 +210,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIs(config["fp16"], True)
         self.assertIs(config["bf16"], False)
         self.assertIsNone(config["max_samples"])
-        self.assertEqual(config["num_train_epochs"], 1)
+        self.assertEqual(config["num_train_epochs"], 2)
         self.assertEqual(config["val_size"], 0)
         self.assertEqual(config["eval_dataset"], "baseline_val")
         self.assertEqual(config["dataset"], "baseline_train")
@@ -233,7 +233,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["hard_example_loss_alpha"], 0.5)
         self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
-        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000")
+        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
     def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
@@ -246,7 +246,7 @@ class KaggleNotebookTests(unittest.TestCase):
         actual = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertIs(type(actual["max_steps"]), int)
         self.assertEqual(actual["max_steps"], -1)
-        self.assertEqual(actual["num_train_epochs"], 1)
+        self.assertEqual(actual["num_train_epochs"], 2)
 
     def test_same_runtime_rerun_is_idempotent(self):
         namespace = self.runtime_namespace()
