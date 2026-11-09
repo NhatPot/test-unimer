@@ -54,9 +54,10 @@ class KaggleNotebookTests(unittest.TestCase):
         settings = next(n.value for n in tree.body if isinstance(n, ast.Assign)
                         and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in n.targets))
         names = ast.literal_eval(settings.values[0]).split(", ")
-        prepared = Path(namespace["BASELINE_DATA_ROOT"]) / "n1000-v0.1-s42"
+        prepared = Path(namespace["BASELINE_DATA_ROOT"]) / "n8000-v0.1-s42"
         result = prepare_from_rows(
             prepared, {name:rows() for name in names}, {name:registry[name] for name in names},
+            max_samples=8000,
             revisions={"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]},
         )
         namespace["EXPECTED_SPLIT_SHA256"] = result["manifest_sha256"]
@@ -218,8 +219,8 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["max_steps"], -1)  # Trainer compares this integer with zero.
         self.assertTrue(config["create_new_adapter"])
         self.assertFalse(config["load_best_model_at_end"])
-        self.assertEqual(config["eval_steps"], 5)
-        self.assertEqual(config["save_steps"], 5)
+        self.assertEqual(config["eval_steps"], 50)
+        self.assertEqual(config["save_steps"], 50)
         self.assertEqual(config["per_device_train_batch_size"], 2)
         self.assertEqual(config["gradient_accumulation_steps"], 64)
         self.assertEqual(config["lora_rank"], 64)
@@ -232,7 +233,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["hard_example_loss_alpha"], 0.5)
         self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
-        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved")
+        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
     def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
