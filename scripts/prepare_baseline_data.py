@@ -241,6 +241,7 @@ def main(argv=None):
     parser.add_argument("--base-yaml")
     parser.add_argument("--runtime-yaml")
     parser.add_argument("--overrides-json")
+    parser.add_argument("--resume-checkpoint")
     args = parser.parse_args(argv)
     overrides = json.loads(args.overrides_json) if args.overrides_json else None
     if overrides is not None:
@@ -249,6 +250,23 @@ def main(argv=None):
         output = Path(args.project_dir) / overrides["output_dir"]
         if output.exists():
             raise ValueError("Training output exists; use a new run to preserve it")
+        if overrides.get("resume_from_checkpoint") or overrides.get("adapter_name_or_path"):
+            raise ValueError("Use --resume-checkpoint for full resume; adapter-only warm start is not this mode")
+    resume_state = None
+    if args.resume_checkpoint:
+        if overrides is None:
+            raise ValueError("Resume requires runtime YAML overrides")
+        from scripts.dagshub_checkpoint import _validate_checkpoint
+        checkpoint = (Path(args.project_dir) / args.resume_checkpoint).resolve()
+        _validate_checkpoint(checkpoint, True, world_size=2, fp16=True)
+        resume_state = json.loads((checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
+        epoch = resume_state.get("epoch")
+        step = resume_state.get("global_step")
+        target = overrides.get("num_train_epochs")
+        if (type(epoch) not in (int, float) or not math.isfinite(epoch) or epoch < 0
+                or type(step) is not int or step < 1
+                or type(target) not in (int, float) or not math.isfinite(target) or target <= epoch):
+            raise ValueError("Resume needs valid saved step/epoch and a total target greater than saved epoch")
     names = overrides["dataset"] if overrides is not None else args.datasets
     if not names:
         raise ValueError("Dataset names are required")
@@ -264,25 +282,32 @@ def main(argv=None):
         # max_samples/val_size are input subset controls, not a second loader split/cap.
         overrides.update(dataset_dir=result["dataset_dir"], dataset=result["train_dataset"],
                          eval_dataset=result["eval_dataset"], val_size=0, max_samples=None,
-                         resume_from_checkpoint=None, adapter_name_or_path=None, max_steps=-1,
-                         create_new_adapter=True)
+                         max_steps=-1, create_new_adapter=not bool(args.resume_checkpoint))
+        clear_keys = ["max_samples"]
+        if args.resume_checkpoint:
+            overrides.update(resume_from_checkpoint=str(checkpoint), adapter_name_or_path=str(checkpoint))
+        else:
+            clear_keys.extend(["resume_from_checkpoint", "adapter_name_or_path"])
         import contextlib
         import sys
         with contextlib.redirect_stdout(sys.stderr):
             config, output, resolved = prepare_runtime_yaml(
                 args.project_dir, args.base_yaml, args.runtime_yaml, overrides=overrides,
-                clear_keys=["max_samples", "resume_from_checkpoint", "adapter_name_or_path"],
+                clear_keys=clear_keys,
                 profile="t4", overwrite=True)
         summary_keys = ("model_name_or_path", "dataset", "eval_dataset", "dataset_dir", "val_size",
                         "num_train_epochs", "max_samples", "max_steps", "seed",
                         "per_device_train_batch_size", "gradient_accumulation_steps", "learning_rate",
                         "lora_rank", "lora_alpha", "quantization_bit", "bf16", "fp16",
                         "save_steps", "eval_steps", "load_best_model_at_end", "resume_from_checkpoint",
+                        "adapter_name_or_path", "create_new_adapter", "lr_scheduler_type", "warmup_ratio",
                         "model_revision", "use_hard_example_loss", "hard_example_loss_alpha",
                         "hard_example_loss_max_weight")
         result.update(yaml_config=str((Path(args.project_dir) / config).resolve()),
                       output_dir=str((Path(args.project_dir) / output).resolve()),
-                      summary={k:resolved.get(k) for k in summary_keys})
+                      summary={k:resolved.get(k) for k in summary_keys},
+                      initial_global_step=resume_state["global_step"] if resume_state else 0,
+                      initial_epoch=resume_state["epoch"] if resume_state else 0)
     print(json.dumps(result, ensure_ascii=False))
 
 

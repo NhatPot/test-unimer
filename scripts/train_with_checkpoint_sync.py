@@ -5,6 +5,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -309,8 +310,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-seconds", type=int, default=20)
     parser.add_argument("--state-path", default="/kaggle/working/checkpoint_sync_state.json")
     parser.add_argument("--allow-model-only", action="store_true")
+    parser.add_argument("--resume-best-checkpoint", default="")
     parser.add_argument("train_overrides", nargs="*")
     return parser.parse_args()
+
+
+def _seed_resume_best(source: Path, output_dir: Path) -> None:
+    """Keep the old best available for reload, retention, sync and the next resume."""
+    from scripts.dagshub_checkpoint import _copy_resume_file
+    if output_dir.exists():
+        raise FileExistsError("Training output already exists; refusing to seed or overwrite it")
+    ready, reason = _checkpoint_ready(source, stable_seconds=0, require_full_checkpoint=True)
+    if not ready:
+        raise RuntimeError(f"Resume best checkpoint is incomplete: {reason}")
+    shutil.copytree(source, output_dir / source.name, copy_function=_copy_resume_file)
+    print(f"[train-wrapper] Preserved parent best checkpoint: {source.name}", flush=True)
 
 
 def main() -> None:
@@ -319,6 +333,8 @@ def main() -> None:
     project_dir = args.project_dir.resolve()
     output_dir = _resolve_path(args.output_dir, project_dir)
     state_path = _resolve_path(args.state_path, project_dir)
+    if getattr(args, "resume_best_checkpoint", ""):
+        _seed_resume_best(Path(args.resume_best_checkpoint).resolve(), output_dir)
     stop_event = threading.Event()
     failures: list[dict[str, str]] = []
     process_holder: dict[str, subprocess.Popen[Any] | None] = {"process": None}

@@ -3,10 +3,12 @@
 Kiến trúc: GitHub giữ source/workflow, Kaggle chỉ cấp compute.
 Thiết kế A/B: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 Đây là hướng dẫn, không tự cấp quyền push/cài đặt/tải dữ liệu/chạy GPU.
+Trước khi thay/xóa cơ chế hoặc công nghệ, giải thích ảnh hưởng và chờ chủ project
+xác nhận; không xem yêu cầu sửa lỗi/dọn notebook là quyền bỏ chức năng.
 
 ## Trước khi chạy
 
-1. Chốt baseline hay cải tiến, subset/manifest, 1 epoch, split ảnh 90/10,
+1. Chốt baseline hay cải tiến, subset/manifest, mặc định 2 epoch cho train mới, split ảnh 90/10,
    eval/save theo step, cấu hình cuối và ngân sách. Không dùng checkpoint700.
 2. Sửa source local, backup notebook trước sửa; xem diff, chạy test nhẹ.
    Notebook giữ thứ tự quen thuộc: cấu hình -> setup -> clone -> thư viện -> YAML -> train -> upload.
@@ -34,6 +36,21 @@ Thiết kế A/B: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
   trước khi xác minh bản đã lưu; không gọi code sync mới chỉ vì file đó tồn tại.
 - Chỉ báo hoàn tất khi có log train, các mốc validation và checkpoint/artifact đúng run.
   Mốc cuối phải phân biệt với best model; nếu thiếu thì báo thiếu, không tự lấp metric.
+
+## Resume khi được giao
+
+- Cell 4.5 khôi phục lựa chọn resume từ v5. Train mới chỉ tắt công tắc, không xóa cell.
+- Chọn đúng actual run ID/checkpoint và tổng epoch đích; không dùng model merge.
+  Nguồn tải vào cache riêng; output/run mới ghi run cha, không ghi đè bản cũ.
+- Quyết định 2026-11-12: bật best theo eval_loss. Giữ checkpoint cuối để resume,
+  best để merge/infer. Nếu state trỏ best ở phiên cũ, tải cả best; chỉ sửa đường dẫn
+  trong bản sao, không xóa/reset best_metric hoặc optimizer/scheduler của nguồn.
+- Kiểm tra full state và manifest; không tự chuyển sang train mới khi resume lỗi.
+- Kéo một run đã hoàn tất lên tổng epoch cao hơn phải xin chốt lịch scheduler trước;
+  không tự reset optimizer/scheduler hoặc coi giống run dài ngay từ đầu.
+- Chi tiết và các cơ chế còn cần duyệt:
+  [RESUME_AND_MECHANISM_AUDIT_2026_11_11.md](RESUME_AND_MECHANISM_AUDIT_2026_11_11.md).
+- Bản sửa mới chỉ kiểm thử local; chưa được coi là đã triển khai lên Kaggle.
 
 ## Khi chủ project yêu cầu phân tích
 

@@ -26,6 +26,7 @@ class KaggleNotebookTests(unittest.TestCase):
         cls.notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
         cls.sources = ["".join(c["source"]) if isinstance(c["source"], list)
                        else c["source"] for c in cls.notebook["cells"]]
+        cls.resume_source = cls.sources.pop(6)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -36,6 +37,7 @@ class KaggleNotebookTests(unittest.TestCase):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             exec(compile(self.sources[1], "cell-1", "exec"), namespace)
+            exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
         return namespace
 
     def runtime_namespace(self):
@@ -43,6 +45,7 @@ class KaggleNotebookTests(unittest.TestCase):
         (project / "scripts").mkdir(parents=True)
         (project / "train").mkdir()
         for name in ("scripts/runtime_yaml.py", "scripts/prepare_baseline_data.py",
+                     "scripts/dagshub_checkpoint.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
         namespace = self.namespace()
@@ -75,7 +78,7 @@ class KaggleNotebookTests(unittest.TestCase):
                               env=env, text=True, capture_output=True, timeout=5)
 
     def test_notebook_structure_and_no_historical_outputs(self):
-        self.assertEqual(len(self.notebook["cells"]), 12)
+        self.assertEqual(len(self.notebook["cells"]), 13)
         self.assertEqual(self.notebook["nbformat"], 4)
         for cell in self.notebook["cells"]:
             if cell["cell_type"] == "code":
@@ -83,10 +86,7 @@ class KaggleNotebookTests(unittest.TestCase):
                 self.assertEqual(cell["outputs"], [])
 
     def test_python_bash_and_embedded_python_parse(self):
-        for index, cell in enumerate(self.notebook["cells"]):
-            if cell["cell_type"] != "code":
-                continue
-            source = self.sources[index]
+        for index, source in enumerate(self.sources[1:] + [self.resume_source], 1):
             with self.subTest(index=index):
                 if source.startswith("%%bash\n"):
                     result = subprocess.run(["/bin/bash", "-n"], input=source.split("\n", 1)[1],
@@ -105,6 +105,11 @@ class KaggleNotebookTests(unittest.TestCase):
                          else [node.module] if isinstance(node, ast.ImportFrom) else [])
                 for name in names:
                     self.assertIn(name.split(".")[0], allowed)
+        for node in ast.walk(ast.parse(self.resume_source)):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(a.name in allowed for a in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertIn(node.module, allowed)
 
     def test_single_training_switch_defaults_off(self):
         namespace = self.namespace()
@@ -218,7 +223,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIsNone(config["adapter_name_or_path"])
         self.assertEqual(config["max_steps"], -1)  # Trainer compares this integer with zero.
         self.assertTrue(config["create_new_adapter"])
-        self.assertFalse(config["load_best_model_at_end"])
+        self.assertTrue(config["load_best_model_at_end"])
         self.assertEqual(config["eval_steps"], 50)
         self.assertEqual(config["save_steps"], 50)
         self.assertEqual(config["per_device_train_batch_size"], 2)
@@ -235,6 +240,76 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
         self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
+
+    def test_resume_cell_defaults_off_without_network(self):
+        with mock.patch("subprocess.run") as run:
+            namespace = self.namespace()
+        run.assert_not_called()
+        self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
+        self.assertIsNone(namespace["RESUME_CHECKPOINT"])
+
+    def test_resume_cell_uses_own_python_cache_and_two_gpu_fp16_states(self):
+        namespace = self.namespace()
+        namespace.update(RUN_TRAINING=True, RUN_DIR=str(self.root / "run"),
+                         PROJECT_DIR=str(self.root), PYTHON="/own-env/bin/python")
+        state = self.root / "run/resume_checkpoint.json"
+        state.parent.mkdir()
+        def download(command, **kwargs):
+            self.assertEqual(command[0], "/own-env/bin/python")
+            self.assertEqual(command[command.index("--world-size") + 1], "2")
+            self.assertIn("--fp16", command)
+            self.assertIn("resume-source", command[command.index("--output-dir") + 1])
+            state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-338"}))
+        source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
+        with mock.patch("subprocess.run", side_effect=download), mock.patch.dict(os.environ), \
+                contextlib.redirect_stdout(io.StringIO()):
+            exec(source, namespace)
+        self.assertEqual(namespace["RESUME_CHECKPOINT"], "/cache/checkpoint-338")
+
+    def test_full_resume_runtime_preserves_checkpoint_and_target_epoch(self):
+        namespace = self.runtime_namespace()
+        checkpoint = self.root / "cache/checkpoint-338"
+        checkpoint.mkdir(parents=True)
+        for name in ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
+                     "scheduler.pt", "scaler.pt", "rng_state_0.pth", "rng_state_1.pth"):
+            (checkpoint / name).write_bytes(b"fixture only; never unpickle")
+        (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 338, "epoch": 2.0}))
+        namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint), RESUME_TOTAL_EPOCHS=4)
+        env = self.run_runtime(namespace)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
+        self.assertEqual(config["resume_from_checkpoint"], str(checkpoint))
+        self.assertEqual(config["adapter_name_or_path"], str(checkpoint))
+        self.assertFalse(config["create_new_adapter"])
+        self.assertEqual(config["num_train_epochs"], 4)
+        self.assertEqual(config["max_steps"], -1)
+        self.assertEqual(config["lr_scheduler_type"], "cosine")
+        self.assertEqual(config["warmup_ratio"], .1)
+        self.assertTrue(config["use_hard_example_loss"])
+        self.assertFalse(Path(namespace["OUTPUT_DIR"]).exists())
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["parent_run_id"], namespace["RESUME_RUN_ID"])
+        self.assertEqual(tags["initial_global_step"], "338")
+        self.assertEqual(tags["initial_epoch"], "2.0")
+        self.assertEqual(tags["variant"], "improved8000_4ep")
+        for target in (2, 1):
+            namespace["RESUME_TOTAL_EPOCHS"] = target
+            with self.subTest(target=target), self.assertRaises(RuntimeError):
+                self.run_runtime(namespace)
+
+    def test_enabled_resume_without_download_does_not_fall_back_to_fresh(self):
+        namespace = self.runtime_namespace()
+        namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=None)
+        with self.assertRaisesRegex(RuntimeError, "Resume"):
+            self.run_runtime(namespace)
+        self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
+
+    def test_fresh_mode_ignores_stale_resume_variable(self):
+        namespace = self.runtime_namespace()
+        namespace["RESUME_CHECKPOINT"] = "/stale/checkpoint-338"
+        env = self.run_runtime(namespace)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
+        self.assertIsNone(config["resume_from_checkpoint"])
+        self.assertTrue(config["create_new_adapter"])
 
     def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
         namespace = self.runtime_namespace()
@@ -315,14 +390,14 @@ class KaggleNotebookTests(unittest.TestCase):
     def test_no_shared_benchmark_upload_or_new_pipeline_claim(self):
         self.assertNotIn("mlflow.start_run", self.sources[10])
         self.assertNotIn("kaggle_test_results", self.sources[10])
-        self.assertIn("không dùng checkpoint cũ", self.sources[0])
+        self.assertIn("Train mới hoặc resume", self.sources[0])
         self.assertIn("wrapper cũ", self.sources[8])
         for index in (4, 9, 11):
             self.assertTrue(self.sources[index].startswith("# %%bash"))
 
     def test_notebook_source_is_shorter_and_setup_readable(self):
-        active = sum(len(s.splitlines()) for s in self.sources)
-        self.assertLess(active, 280)
+        active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source])
+        self.assertLess(active, 330)
         self.assertLess(len(self.sources[2].splitlines()), 22)
 
     def test_summary_cli_is_opt_in_and_does_not_include_arbitrary_secrets(self):

@@ -1,7 +1,54 @@
 # Hướng dẫn cho AI Agent
 
-Cập nhật 2026-11-06. Áp dụng cho Codex, subagent và Antigravity.
+Cập nhật 2026-11-12. Áp dụng cho Codex, subagent và Antigravity.
 Đọc file này; chỉ mở thêm tài liệu đúng nhiệm vụ. Không bắt đầu từ kế hoạch cũ.
+
+## Phải hỏi trước khi đổi cơ chế
+
+- Trước khi xóa, thay thế, vô hiệu hóa lâu dài hoặc đổi mặc định của công nghệ/cơ chế,
+  giải thích thay đổi, lý do và ảnh hưởng rồi chờ chủ project xác nhận rõ ràng.
+  Lệnh chung như "sửa cho chạy được", "dọn code" hoặc "làm tiếp" không phải quyền bỏ cơ chế.
+- Áp dụng cho resume, checkpoint, sync/upload, chọn best/final model, train/validation,
+  inference/chấm điểm, backbone, loss, dependency, precision/quantization và scheduler.
+- Train mới chỉ TẮT resume bằng tùy chọn; phải giữ khả năng resume cho lần sau.
+  Không âm thầm đổi full resume thành chỉ nạp adapter hoặc tạo adapter mới.
+- Backup notebook trước sửa, đối chiếu các chức năng trước/sau; báo rõ phần giữ nguyên,
+  phần đã được duyệt và phần còn cần hỏi. Không tự sửa run hay kết quả đã hoàn tất.
+- Quy tắc này áp dụng cả coordinator, Antigravity và subagent; phải đưa vào brief giao việc.
+- Ngày 2026-11-12 chủ project đã giao triển khai và chạy B resume epoch 2 -> tổng 4,
+  bật lại chọn best theo eval_loss như v5, giữ eval/save mỗi 50 bước, NF4 + FP16.
+  Được push đúng dev-caitien, backup rồi cập nhật notebook Kaggle và Save & Run All.
+  Không reset optimizer/scheduler; dùng full resume chuẩn Trainer với tổng đích mới,
+  ghi rõ khác run đặt 4 epoch ngay từ đầu. Không tự đổi cơ chế khác hoặc bật benchmark.
+
+## Trạng thái và quy trình hiện hành
+
+- Nhánh dev-caitien là B: cùng backbone Qwen2.5-VL-3B-Instruct, thêm loss ưu tiên mẫu khó.
+  B gần nhất đã hoàn tất 2 epoch/338 bước, MLflow 619dd8beecbf4eb5a533f4c6618409b7.
+- Train mới mặc định 2 epoch, max_steps=-1; resume là lựa chọn riêng khi được giao.
+  RESUME_TOTAL_EPOCHS là TỔNG đích: từ epoch 2 lên 4 nghĩa là học thêm khoảng 2 epoch.
+- Giữ 8.000 dòng/nguồn trước split; 43.242 train/4.758 val, cùng split manifest A/B.
+  Validation dùng loss chuẩn. Giữ batch, seed, backbone/revision, FP16/NF4 và loss B.
+- Resume dùng checkpoint huấn luyện đầy đủ, không dùng model merge: adapter/config,
+  optimizer, scheduler, trainer_state, scaler FP16 và RNG cho cả hai GPU.
+  Tải nguồn vào cache riêng; lưu kết quả bằng RUN_UUID/output mới, ghi run cha.
+- Khi bật load_best_model_at_end, phải giữ cả best checkpoint cũ (B hiện tại là 300),
+  không chỉ tải checkpoint cuối 338. Chỉ đổi đường dẫn best trong BẢN SAO làm việc;
+  không sửa byte/state của checkpoint nguồn đã kiểm SHA256. Wrapper chép best vào
+  output mới ngay trước train để retention, sync và lần resume sau vẫn tìm được.
+- Khi kéo run đã hoàn tất từ 2 lên 4 epoch, phải trình bày và xin chốt cách xử lý
+  lịch cosine; không tự reset scheduler/optimizer hoặc tuyên bố giống train 4 epoch từ đầu.
+- Trước khi chạy thật: kiểm tra cấu hình cuối, split, full state và log tải checkpoint;
+  sau step 338 phải tiếp tục bộ đếm, không bắt đầu lại từ 0. Kiểm thử CPU không chứng
+  minh optimizer/RNG đã được khôi phục trong phiên Kaggle.
+- Phiên Kaggle tối đa 12 giờ theo ngân sách đã chốt, gồm setup/eval/upload và ít nhất
+  1 giờ dự phòng. Không tự giảm sample/epoch hoặc đổi batch/LR khi thiếu thời gian.
+- Cơ chế được rà soát: docs/RESUME_AND_MECHANISM_AUDIT_2026_11_11.md.
+
+## Snapshot ngày 2026-11-06 (chỉ tham khảo)
+
+Đoạn trạng thái cũ dưới đây không phải cấu hình hay lệnh thực thi hiện tại.
+Các mục "Trạng thái và quy trình hiện hành" và "Phải hỏi trước khi đổi cơ chế" ưu tiên.
 
 Phạm vi mới được chủ project giao: triển khai B trên nhánh dev-caitien từ commit
 baseline 0f65e4cc4c67b042998b84c5ac068abeeca09719. Không sửa checkout dev_tt.
