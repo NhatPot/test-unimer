@@ -41,16 +41,23 @@ xác nhận; không xem yêu cầu sửa lỗi/dọn notebook là quyền bỏ c
 
 - Cell 4.5 khôi phục lựa chọn resume từ v5. Train mới chỉ tắt công tắc, không xóa cell.
 - Chọn đúng actual run ID/checkpoint và tổng epoch đích; không dùng model merge.
-  Nguồn tải vào cache riêng; output/run mới ghi run cha, không ghi đè bản cũ.
+  Nguồn tải vào vùng chuẩn bị riêng; output/run mới ghi run cha, không ghi đè bản cũ.
 - Quyết định 2026-11-12: bật best theo eval_loss. Giữ checkpoint cuối để resume,
   best để merge/infer. Nếu state trỏ best ở phiên cũ, tải cả best; chỉ sửa đường dẫn
-  trong bản sao, không xóa/reset best_metric hoặc optimizer/scheduler của nguồn.
+  trong bản tải cho run mới, giữ JSON gốc làm bằng chứng; không reset best_metric
+  hoặc optimizer/scheduler. Sau kiểm tra, wrapper di chuyển best/latest vào output
+  để Trainer quản lý retention; cache không được giữ thêm weights/optimizer/hardlink.
+- Giữ save_total_limit=2; dự trù checkpoint thứ ba tạm thời vì lưu xong mới rotation.
+  Kiểm tra chỗ trống lúc bắt đầu và trước mỗi lần lưu, cộng 1 GiB dự phòng.
+  Thiếu dung lượng thì báo lỗi trước khi lưu, không tự xóa checkpoint hoặc đổi cấu hình.
 - Kiểm tra full state và manifest; không tự chuyển sang train mới khi resume lỗi.
 - Kéo một run đã hoàn tất lên tổng epoch cao hơn phải xin chốt lịch scheduler trước;
   không tự reset optimizer/scheduler hoặc coi giống run dài ngay từ đầu.
 - Chi tiết và các cơ chế còn cần duyệt:
   [RESUME_AND_MECHANISM_AUDIT_2026_11_11.md](RESUME_AND_MECHANISM_AUDIT_2026_11_11.md).
 - Bản sửa mới chỉ kiểm thử local; chưa được coi là đã triển khai lên Kaggle.
+- Chi tiết lỗi ổ đĩa và bản sửa 2026-11-12:
+  [CHECKPOINT_STORAGE_FIX_2026_11_12.md](CHECKPOINT_STORAGE_FIX_2026_11_12.md).
 
 ## Khi chủ project yêu cầu phân tích
 

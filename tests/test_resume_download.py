@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts import dagshub_checkpoint as downloader
-from scripts.train_with_checkpoint_sync import _seed_resume_best
+from scripts.checkpoint_storage import activate_resume
 
 
 class ResumeDownloadTests(unittest.TestCase):
@@ -152,7 +152,7 @@ class ResumeDownloadTests(unittest.TestCase):
         ]}))
         return state
 
-    def test_resume_preserves_best_and_does_not_modify_verified_source(self):
+    def test_resume_preserves_best_and_moves_downloads_under_retention(self):
         original_state = self.add_best()
         output = self.root / "new-run/checkpoints"
         working = self.prepare(training_output_dir=output)
@@ -162,19 +162,43 @@ class ResumeDownloadTests(unittest.TestCase):
         self.assertEqual(state["best_metric"], .09)
         self.assertEqual(state["best_model_checkpoint"], str(output / "checkpoint-300"))
         self.assertFalse(output.exists())
-        cached = self.root / ("cache/" + "a" * 32 + "/checkpoint-338")
-        self.assertEqual(json.loads((cached / "trainer_state.json").read_text()), original_state)
-        self.assertNotEqual((cached / "trainer_state.json").stat().st_ino,
-                            (working / "trainer_state.json").stat().st_ino)
-        for file in cached.iterdir():
+        cache = self.root / ("cache/" + "a" * 32)
+        self.assertEqual(json.loads((cache / "source_trainer_state.json").read_text()), original_state)
+        self.assertEqual(json.loads((self.remote / "trainer_state.json").read_text()), original_state)
+        self.assertFalse((cache / "checkpoint-338").exists())
+        self.assertFalse((cache / "checkpoint-300").exists())
+        self.assertFalse((cache / "relocated").exists())
+        for file in self.remote.iterdir():
             if file.name != "trainer_state.json":
                 self.assertEqual(file.read_bytes(), (working / file.name).read_bytes())
-        best = Path(os.environ["RESUME_BEST_CHECKPOINT"])
-        _seed_resume_best(best, output)
+        config = output.parent / "runtime.yaml"
+        config.parent.mkdir(parents=True)
+        import yaml
+        original_config = dict(output_dir=str(output), resume_from_checkpoint=str(working),
+                               adapter_name_or_path=str(working), create_new_adapter=False,
+                               load_best_model_at_end=True, save_total_limit=2, learning_rate=.0001)
+        config.write_text(yaml.safe_dump(original_config))
+        prepared = Path(os.environ["RESUME_PREPARED_OUTPUT"])
+        activate_resume(prepared, output, config, self.root)
         self.assertTrue((output / "checkpoint-300/optimizer.pt").is_file())
-        self.assertTrue(best.is_dir())
+        self.assertTrue((output / "checkpoint-338/optimizer.pt").is_file())
+        self.assertFalse(prepared.exists())
+        changed = yaml.safe_load(config.read_text())
+        self.assertEqual(changed["resume_from_checkpoint"], str(output / "checkpoint-338"))
+        self.assertEqual(changed["adapter_name_or_path"], str(output / "checkpoint-338"))
+        self.assertEqual(changed["learning_rate"], original_config["learning_rate"])
         with self.assertRaises(FileExistsError):
-            _seed_resume_best(best, output)
+            self.prepare(training_output_dir=output)
+
+    def test_prepared_resume_rerun_revalidates_without_duplicate_download(self):
+        self.add_best()
+        first = self.prepare(training_output_dir=self.root / "new-output")
+        self.client.artifacts.download_artifacts.reset_mock()
+        self.assertEqual(self.prepare(training_output_dir=self.root / "new-output"), first)
+        self.client.artifacts.download_artifacts.assert_not_called()
+        (first / "optimizer.pt").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "Prepared resume"):
+            self.prepare(training_output_dir=self.root / "new-output")
 
     def test_missing_parent_best_does_not_silently_reset_best_metric(self):
         self.add_best()

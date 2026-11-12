@@ -259,7 +259,8 @@ class KaggleNotebookTests(unittest.TestCase):
             self.assertEqual(command[command.index("--world-size") + 1], "2")
             self.assertIn("--fp16", command)
             self.assertIn("resume-source", command[command.index("--output-dir") + 1])
-            state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-338"}))
+            state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-338",
+                                         "prepared_output": "/cache/prepared-output"}))
         source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
         with mock.patch("subprocess.run", side_effect=download), mock.patch.dict(os.environ), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -302,6 +303,10 @@ class KaggleNotebookTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Resume"):
             self.run_runtime(namespace)
         self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
+
+    def test_training_uses_prepared_resume_not_the_old_persistent_best_cache(self):
+        self.assertIn('--resume-prepared-output "$RESUME_PREPARED_OUTPUT"', self.sources[8])
+        self.assertNotIn("--resume-best-checkpoint", self.sources[8])
 
     def test_fresh_mode_ignores_stale_resume_variable(self):
         namespace = self.runtime_namespace()

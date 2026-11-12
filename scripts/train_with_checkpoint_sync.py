@@ -311,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-path", default="/kaggle/working/checkpoint_sync_state.json")
     parser.add_argument("--allow-model-only", action="store_true")
     parser.add_argument("--resume-best-checkpoint", default="")
+    parser.add_argument("--resume-prepared-output", default="")
     parser.add_argument("train_overrides", nargs="*")
     return parser.parse_args()
 
@@ -333,7 +334,12 @@ def main() -> None:
     project_dir = args.project_dir.resolve()
     output_dir = _resolve_path(args.output_dir, project_dir)
     state_path = _resolve_path(args.state_path, project_dir)
-    if getattr(args, "resume_best_checkpoint", ""):
+    storage_plan = None
+    if getattr(args, "resume_prepared_output", ""):
+        from scripts.checkpoint_storage import activate_resume
+        storage_plan = activate_resume(args.resume_prepared_output, output_dir,
+                                       _resolve_path(args.yaml_config, project_dir), project_dir)
+    elif getattr(args, "resume_best_checkpoint", ""):
         _seed_resume_best(Path(args.resume_best_checkpoint).resolve(), output_dir)
     stop_event = threading.Event()
     failures: list[dict[str, str]] = []
@@ -382,6 +388,9 @@ def main() -> None:
     print(f"[train-wrapper] Checkpoint sync interval: {args.interval_seconds}s", flush=True)
     # Never echo arbitrary overrides or SDK exceptions: either may contain credentials.
     child_env = os.environ.copy()
+    child_env.pop("CHECKPOINT_STORAGE_PLAN", None)
+    if storage_plan:
+        child_env["CHECKPOINT_STORAGE_PLAN"] = storage_plan
     tags = json.loads(child_env.get("MLFLOW_TAGS", "{}"))
     if not isinstance(tags, dict):
         raise ValueError("MLFLOW_TAGS must be a JSON object")

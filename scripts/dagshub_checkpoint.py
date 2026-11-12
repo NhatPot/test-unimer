@@ -121,6 +121,7 @@ def prepare_resume_checkpoint(
     print(f"DagsHub Resume: {'ON' if enabled else 'OFF'}")
     os.environ.pop("RESUME_CHECKPOINT", None)
     os.environ.pop("RESUME_BEST_CHECKPOINT", None)
+    os.environ.pop("RESUME_PREPARED_OUTPUT", None)
     if not enabled:
         return None
 
@@ -142,6 +143,27 @@ def prepare_resume_checkpoint(
         raise ValueError("artifact_path must select a checkpoint directory")
     output_path = _resolve_path(project_dir, output_dir) / run_id
     output_path.mkdir(parents=True, exist_ok=True)
+
+    if training_output_dir is not None:
+        from scripts.checkpoint_storage import verify_prepared
+        training_output = _resolve_path(project_dir, training_output_dir).resolve()
+        if training_output.exists():
+            raise FileExistsError("Resume needs a new training output; existing output is preserved")
+        receipt = output_path / "resume_relocation.json"
+        if receipt.exists():
+            plan = json.loads(receipt.read_text(encoding="utf-8"))
+            if (plan.get("schema_version") != 2 or plan.get("activated")
+                    or plan.get("source_run_id") != run_id or plan.get("source_artifact") != artifact_path
+                    or plan.get("training_output_dir") != str(training_output)):
+                raise ValueError("Existing resume cache belongs to another plan; preserve it and use a new run")
+            verify_prepared(plan)
+            prepared = Path(plan["prepared_output_dir"])
+            os.environ["RESUME_PREPARED_OUTPUT"] = str(prepared)
+            if plan["best_checkpoint_name"]:
+                os.environ["RESUME_BEST_CHECKPOINT"] = str(prepared / plan["best_checkpoint_name"])
+            checkpoint = str(prepared / plan["checkpoint_name"])
+            os.environ["RESUME_CHECKPOINT"] = checkpoint
+            return checkpoint
 
     checkpoint_name = Path(artifact_path).name
     expected_path = output_path / checkpoint_name
@@ -191,11 +213,10 @@ def prepare_resume_checkpoint(
                 raise ValueError(f"Checkpoint file absent from manifest: {path.name}")
         print("Checkpoint bytes match the selected run's artifact manifest (SHA256).")
     if training_output_dir is not None:
-        training_output = _resolve_path(project_dir, training_output_dir).resolve()
-        if training_output.exists():
-            raise FileExistsError("Resume needs a new training output; existing output is preserved")
+        from scripts.checkpoint_storage import stage_resume
         state = json.loads((local_checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
         old_best = state.get("best_model_checkpoint")
+        best_checkpoint = None
         if old_best:
             best_name = Path(old_best).name
             if not best_name.startswith("checkpoint-") or not best_name[11:].isdigit():
@@ -208,26 +229,14 @@ def prepare_resume_checkpoint(
                     require_full_checkpoint=True, world_size=world_size, fp16=fp16,
                     manifest_artifact=manifest_artifact,
                 ))
-            # Relocate only a working copy; never change the verified source checkpoint.
-            relocated_state = dict(state, best_model_checkpoint=str(training_output / best_name))
-            working = output_path / "relocated" / checkpoint_name
-            if working.exists():
-                if json.loads((working / "trainer_state.json").read_text()) != relocated_state:
-                    raise ValueError("Existing working checkpoint differs; preserve it and use a new run")
-            else:
-                shutil.copytree(local_checkpoint, working, copy_function=_copy_resume_file)
-                (working / "trainer_state.json").write_text(
-                    json.dumps(relocated_state, indent=2, ensure_ascii=False), encoding="utf-8")
-            (output_path / "resume_relocation.json").write_text(json.dumps({
-                "source_checkpoint": str(local_checkpoint), "working_checkpoint": str(working),
-                "old_best_model_checkpoint": old_best,
-                "new_best_model_checkpoint": relocated_state["best_model_checkpoint"],
-                "best_checkpoint_source": str(best_checkpoint),
-                "global_step": state.get("global_step"), "epoch": state.get("epoch"),
-            }, indent=2), encoding="utf-8")
-            local_checkpoint = working
-            os.environ["RESUME_BEST_CHECKPOINT"] = str(best_checkpoint)
-            print(f"Best checkpoint {best_name} will be preserved in the new training output.")
+        plan = stage_resume(local_checkpoint, best_checkpoint, output_path, training_output,
+                            run_id=run_id, artifact_path=artifact_path)
+        prepared = Path(plan["prepared_output_dir"])
+        local_checkpoint = prepared / checkpoint_name
+        os.environ["RESUME_PREPARED_OUTPUT"] = str(prepared)
+        if plan["best_checkpoint_name"]:
+            os.environ["RESUME_BEST_CHECKPOINT"] = str(prepared / plan["best_checkpoint_name"])
+        print("Resume best/latest staged once; wrapper will move them into Trainer retention.")
     os.environ["RESUME_CHECKPOINT"] = str(local_checkpoint)
 
     print(f"Resume run_id: {run_id}")
@@ -254,6 +263,8 @@ def prepare_resume_checkpoint_via_python(
     """Run checkpoint download with the training Python environment."""
     print(f"DagsHub Resume: {'ON' if enabled else 'OFF'}")
     os.environ.pop("RESUME_CHECKPOINT", None)
+    os.environ.pop("RESUME_BEST_CHECKPOINT", None)
+    os.environ.pop("RESUME_PREPARED_OUTPUT", None)
     if not enabled:
         return None
 
@@ -338,6 +349,7 @@ def main() -> None:
                 "run_uuid": args.run_uuid,
                 "artifact_path": args.artifact_path,
                 "best_checkpoint": os.environ.get("RESUME_BEST_CHECKPOINT", ""),
+                "prepared_output": os.environ.get("RESUME_PREPARED_OUTPUT", ""),
             },
             indent=2,
             ensure_ascii=False,

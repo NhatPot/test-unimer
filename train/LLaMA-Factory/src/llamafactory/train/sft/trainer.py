@@ -92,6 +92,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
+        storage_plan = os.environ.get("CHECKPOINT_STORAGE_PLAN")
+        if storage_plan:
+            from scripts.checkpoint_storage import make_storage_callback
+
+            self.add_callback(make_storage_callback(storage_plan))
+
         if finetuning_args.use_badam:
             from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore
 

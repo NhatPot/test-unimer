@@ -15,27 +15,44 @@ Cập nhật 2026-11-12. Áp dụng cho Codex, subagent và Antigravity.
 - Backup notebook trước sửa, đối chiếu các chức năng trước/sau; báo rõ phần giữ nguyên,
   phần đã được duyệt và phần còn cần hỏi. Không tự sửa run hay kết quả đã hoàn tất.
 - Quy tắc này áp dụng cả coordinator, Antigravity và subagent; phải đưa vào brief giao việc.
-- Ngày 2026-11-12 chủ project đã giao triển khai và chạy B resume epoch 2 -> tổng 4,
+- Lịch sử: ngày 2026-11-12 chủ project đã giao triển khai và chạy B resume epoch 2 -> tổng 4,
   bật lại chọn best theo eval_loss như v5, giữ eval/save mỗi 50 bước, NF4 + FP16.
   Được push đúng dev-caitien, backup rồi cập nhật notebook Kaggle và Save & Run All.
   Không reset optimizer/scheduler; dùng full resume chuẩn Trainer với tổng đích mới,
   ghi rõ khác run đặt 4 epoch ngay từ đầu. Không tự đổi cơ chế khác hoặc bật benchmark.
+- Phiên đó đã lỗi hết dung lượng khi lưu bước 500. Lượt sửa hiện tại chỉ sửa local
+  và kiểm thử nhẹ, KHÔNG tự dùng quyền của phiên cũ để push hoặc chạy Kaggle lại.
+- Sau kiểm thử, chủ project đã giao mới: "ok bắt đầu lại từ epoch 2-4 đi".
+  Được push bản sửa cache lên dev-caitien, backup/cập nhật Kaggle và Save & Run All
+  B từ parent 619dd8beecbf4eb5a533f4c6618409b7, checkpoint-338 (epoch 2) tới tổng 4.
+  Giữ best-300 và toàn bộ cấu hình đã chốt; dùng run/output mới, không lấy 450.
+  Đây là triển khai được giao, chưa phải bằng chứng job đã train thành công.
 
 ## Trạng thái và quy trình hiện hành
 
 - Nhánh dev-caitien là B: cùng backbone Qwen2.5-VL-3B-Instruct, thêm loss ưu tiên mẫu khó.
   B gần nhất đã hoàn tất 2 epoch/338 bước, MLflow 619dd8beecbf4eb5a533f4c6618409b7.
+- Phiên resume 75ca700978c840898f9504d17006421c chưa hoàn tất 4 epoch:
+  lỗi ổ đĩa khi lưu bước 500; DagsHub có checkpoints/checkpoint-450.
+  Mới kiểm tra danh sách file/state của 450, chưa tải và xác minh toàn bộ trọng số.
+  Không tự đổi nguồn resume từ 338 sang 450 trước khi xác minh và chốt run tiếp.
 - Train mới mặc định 2 epoch, max_steps=-1; resume là lựa chọn riêng khi được giao.
   RESUME_TOTAL_EPOCHS là TỔNG đích: từ epoch 2 lên 4 nghĩa là học thêm khoảng 2 epoch.
 - Giữ 8.000 dòng/nguồn trước split; 43.242 train/4.758 val, cùng split manifest A/B.
   Validation dùng loss chuẩn. Giữ batch, seed, backbone/revision, FP16/NF4 và loss B.
 - Resume dùng checkpoint huấn luyện đầy đủ, không dùng model merge: adapter/config,
   optimizer, scheduler, trainer_state, scaler FP16 và RNG cho cả hai GPU.
-  Tải nguồn vào cache riêng; lưu kết quả bằng RUN_UUID/output mới, ghi run cha.
+  Tải nguồn vào vùng chuẩn bị riêng; lưu bằng RUN_UUID/output mới, ghi run cha.
 - Khi bật load_best_model_at_end, phải giữ cả best checkpoint cũ (B hiện tại là 300),
-  không chỉ tải checkpoint cuối 338. Chỉ đổi đường dẫn best trong BẢN SAO làm việc;
-  không sửa byte/state của checkpoint nguồn đã kiểm SHA256. Wrapper chép best vào
-  output mới ngay trước train để retention, sync và lần resume sau vẫn tìm được.
+  không chỉ tải checkpoint cuối 338. Giữ nguyên artifact nguồn trên DagsHub và lưu
+  trainer_state gốc làm bằng chứng; chỉ đổi đường dẫn best trong bản tải cho run mới.
+  Sau xác minh, DI CHUYỂN best/latest vào output mới trước train để Trainer quản lý
+  retention. Không giữ thêm bản nặng/hardlink ở cache ngoài output; không đụng run cũ.
+- Giữ save_total_limit=2 và load_best_model_at_end=True: best để chọn inference,
+  latest full state để resume. Trainer lưu bản mới TRƯỚC khi dọn bản cũ, cần chỗ cho
+  checkpoint thứ ba tạm thời. Kiểm tra dung lượng lúc bắt đầu và trước mỗi lần lưu,
+  cộng 1 GiB dự phòng; thiếu thì báo lỗi, không tự xóa checkpoint hay đổi thông số.
+- Bản sửa dung lượng và giới hạn kiểm chứng: docs/CHECKPOINT_STORAGE_FIX_2026_11_12.md.
 - Khi kéo run đã hoàn tất từ 2 lên 4 epoch, phải trình bày và xin chốt cách xử lý
   lịch cosine; không tự reset scheduler/optimizer hoặc tuyên bố giống train 4 epoch từ đầu.
 - Trước khi chạy thật: kiểm tra cấu hình cuối, split, full state và log tải checkpoint;
