@@ -304,6 +304,34 @@ class KaggleNotebookTests(unittest.TestCase):
             self.run_runtime(namespace)
         self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
 
+    def test_resume_epoch_four_to_six_preserves_full_state_paths_and_training_settings(self):
+        namespace = self.runtime_namespace()
+        self.assertEqual(namespace["RESUME_RUN_ID"], "51c046b18b5140a080c387416d4828e8")
+        self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], "training/checkpoint-676")
+        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 6)
+        checkpoint = self.root / "cache/checkpoint-676"
+        checkpoint.mkdir(parents=True)
+        for name in ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
+                     "scheduler.pt", "scaler.pt", "rng_state_0.pth", "rng_state_1.pth"):
+            (checkpoint / name).write_bytes(b"fixture only; never unpickle")
+        (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 676, "epoch": 4.0}))
+        namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint))
+        env = self.run_runtime(namespace)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
+        self.assertEqual(config["resume_from_checkpoint"], str(checkpoint))
+        self.assertEqual(config["adapter_name_or_path"], str(checkpoint))
+        self.assertFalse(config["create_new_adapter"])
+        self.assertEqual(config["num_train_epochs"], 6)
+        self.assertEqual(config["max_steps"], -1)
+        self.assertEqual(config["lr_scheduler_type"], "cosine")
+        self.assertEqual(config["save_steps"], 50)
+        self.assertEqual(config["eval_steps"], 50)
+        self.assertEqual(config["save_total_limit"], 2)
+        self.assertTrue(config["load_best_model_at_end"])
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["initial_global_step"], "676")
+        self.assertEqual(tags["initial_epoch"], "4.0")
+
     def test_training_uses_prepared_resume_not_the_old_persistent_best_cache(self):
         self.assertIn('--resume-prepared-output "$RESUME_PREPARED_OUTPUT"', self.sources[8])
         self.assertNotIn("--resume-best-checkpoint", self.sources[8])

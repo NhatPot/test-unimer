@@ -1,6 +1,6 @@
 # Hướng dẫn cho AI Agent
 
-Cập nhật 2026-11-12. Áp dụng cho Codex, subagent và Antigravity.
+Cập nhật 2026-11-15. Áp dụng cho Codex, subagent và Antigravity.
 Đọc file này; chỉ mở thêm tài liệu đúng nhiệm vụ. Không bắt đầu từ kế hoạch cũ.
 
 ## Phải hỏi trước khi đổi cơ chế
@@ -27,24 +27,33 @@ Cập nhật 2026-11-12. Áp dụng cho Codex, subagent và Antigravity.
   B từ parent 619dd8beecbf4eb5a533f4c6618409b7, checkpoint-338 (epoch 2) tới tổng 4.
   Giữ best-300 và toàn bộ cấu hình đã chốt; dùng run/output mới, không lấy 450.
   Đây là triển khai được giao, chưa phải bằng chứng job đã train thành công.
+- Ngày 2026-11-15 chủ project giao: "cho chay train tu epoch 4-6 di".
+  Được triển khai B full resume từ training/checkpoint-676 của run
+  51c046b18b5140a080c387416d4828e8 lên TỔNG 6 epoch, giữ best-500 và thông số cũ.
+  Không reset optimizer/scheduler/scaler/RNG hoặc nạp model merge thay checkpoint.
+  Được push đúng dev-caitien, backup notebook Kaggle rồi Save & Run All một run mới.
+  Giữ cách mở rộng lịch train như phiên 2 -> 4; không coi giống train 6 epoch từ đầu.
 
 ## Trạng thái và quy trình hiện hành
 
 - Nhánh dev-caitien là B: cùng backbone Qwen2.5-VL-3B-Instruct, thêm loss ưu tiên mẫu khó.
-  B gần nhất đã hoàn tất 2 epoch/338 bước, MLflow 619dd8beecbf4eb5a533f4c6618409b7.
+  B gần nhất đã hoàn tất 4 epoch/676 bước, MLflow 51c046b18b5140a080c387416d4828e8.
+  Best theo validation là checkpoint-500, eval_loss=0.08452466130256653.
+  Phiên 2 -> 4 dùng bản sửa cache đã hoàn tất trên Kaggle Version 6 (368728517),
+  10 giờ 58 phút gồm setup/train/eval/upload. Parent epoch 2 là run 619dd8beecbf4eb5a533f4c6618409b7.
 - Phiên resume 75ca700978c840898f9504d17006421c chưa hoàn tất 4 epoch:
   lỗi ổ đĩa khi lưu bước 500; DagsHub có checkpoints/checkpoint-450.
   Mới kiểm tra danh sách file/state của 450, chưa tải và xác minh toàn bộ trọng số.
   Không tự đổi nguồn resume từ 338 sang 450 trước khi xác minh và chốt run tiếp.
 - Train mới mặc định 2 epoch, max_steps=-1; resume là lựa chọn riêng khi được giao.
-  RESUME_TOTAL_EPOCHS là TỔNG đích: từ epoch 2 lên 4 nghĩa là học thêm khoảng 2 epoch.
+  RESUME_TOTAL_EPOCHS là TỔNG đích: từ epoch 4 lên 6 nghĩa là học thêm khoảng 2 epoch.
 - Giữ 8.000 dòng/nguồn trước split; 43.242 train/4.758 val, cùng split manifest A/B.
   Validation dùng loss chuẩn. Giữ batch, seed, backbone/revision, FP16/NF4 và loss B.
 - Resume dùng checkpoint huấn luyện đầy đủ, không dùng model merge: adapter/config,
   optimizer, scheduler, trainer_state, scaler FP16 và RNG cho cả hai GPU.
   Tải nguồn vào vùng chuẩn bị riêng; lưu bằng RUN_UUID/output mới, ghi run cha.
-- Khi bật load_best_model_at_end, phải giữ cả best checkpoint cũ (B hiện tại là 300),
-  không chỉ tải checkpoint cuối 338. Giữ nguyên artifact nguồn trên DagsHub và lưu
+- Khi bật load_best_model_at_end, phải giữ cả best checkpoint cũ (B hiện tại là 500),
+  không chỉ tải checkpoint cuối 676. Giữ nguyên artifact nguồn trên DagsHub và lưu
   trainer_state gốc làm bằng chứng; chỉ đổi đường dẫn best trong bản tải cho run mới.
   Sau xác minh, DI CHUYỂN best/latest vào output mới trước train để Trainer quản lý
   retention. Không giữ thêm bản nặng/hardlink ở cache ngoài output; không đụng run cũ.
@@ -53,10 +62,10 @@ Cập nhật 2026-11-12. Áp dụng cho Codex, subagent và Antigravity.
   checkpoint thứ ba tạm thời. Kiểm tra dung lượng lúc bắt đầu và trước mỗi lần lưu,
   cộng 1 GiB dự phòng; thiếu thì báo lỗi, không tự xóa checkpoint hay đổi thông số.
 - Bản sửa dung lượng và giới hạn kiểm chứng: docs/CHECKPOINT_STORAGE_FIX_2026_11_12.md.
-- Khi kéo run đã hoàn tất từ 2 lên 4 epoch, phải trình bày và xin chốt cách xử lý
+- Khi kéo run đã hoàn tất lên tổng epoch cao hơn, phải trình bày và xin chốt cách xử lý
   lịch cosine; không tự reset scheduler/optimizer hoặc tuyên bố giống train 4 epoch từ đầu.
 - Trước khi chạy thật: kiểm tra cấu hình cuối, split, full state và log tải checkpoint;
-  sau step 338 phải tiếp tục bộ đếm, không bắt đầu lại từ 0. Kiểm thử CPU không chứng
+  sau step 676 phải tiếp tục bộ đếm, không bắt đầu lại từ 0. Kiểm thử CPU không chứng
   minh optimizer/RNG đã được khôi phục trong phiên Kaggle.
 - Phiên Kaggle tối đa 12 giờ theo ngân sách đã chốt, gồm setup/eval/upload và ít nhất
   1 giờ dự phòng. Không tự giảm sample/epoch hoặc đổi batch/LR khi thiếu thời gian.
