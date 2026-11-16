@@ -33,6 +33,7 @@ from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 from .hard_example_loss import compute_hard_example_weighted_loss, validate_hard_example_loss_config
+from .hard_example_metrics import HardExampleWeightStats
 
 
 if TYPE_CHECKING:
@@ -84,6 +85,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # Hard-example loss is normalized by the microbatch weighted token count,
             # so Trainer.training_step must divide by gradient_accumulation_steps once.
             self.model_accepts_loss_kwargs = False
+            self._hard_example_weight_stats = HardExampleWeightStats()
 
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
@@ -158,6 +160,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             raise ValueError("Cannot use `use_hard_example_loss` with liger kernel.")
 
     @override
+    def log(self, logs, *args, **kwargs):
+        stats = getattr(self, "_hard_example_weight_stats", None)
+        if stats is not None and ("loss" in logs or "train_loss" in logs):
+            logs = {**logs, **stats.take(self.args.device)}
+        return super().log(logs, *args, **kwargs)
+
+    @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
             self.optimizer = create_custom_optimizer(self.model, self.args, self.finetuning_args)
@@ -230,13 +239,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 "(incompatible with fused loss kernels that omit logits)."
             )
 
-        loss = compute_hard_example_weighted_loss(
+        loss, details = compute_hard_example_weighted_loss(
             logits=logits,
             labels=labels,
             alpha=self.finetuning_args.hard_example_loss_alpha,
             max_weight=self.finetuning_args.hard_example_loss_max_weight,
             ignore_index=IGNORE_INDEX,
+            return_details=True,
         )
+        self._hard_example_weight_stats.update(details.weights, details.valid_token_counts)
 
         if return_outputs or self.args.past_index >= 0:
             if isinstance(outputs, MutableMapping):

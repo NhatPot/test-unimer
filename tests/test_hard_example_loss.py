@@ -805,6 +805,32 @@ class CustomSeq2SeqTrainerHardExampleIntegrationTests(unittest.TestCase):
                 ):
                     self.assertTrue(torch.allclose(p_step.grad, p_dir.grad / gas, atol=1e-6))
 
+    def test_weight_logging_does_not_change_validation_or_consume_train_window(self):
+        trainer = self.make_trainer(finetuning_args=FinetuningArguments(use_hard_example_loss=True))
+        trainer.model.train()
+        loss = trainer.compute_loss(trainer.model, dict(self.batch))
+        self.assertEqual(len(trainer.model.forward_calls), 1)
+        trainer.model.eval()
+        measured_eval = trainer.compute_loss(trainer.model, dict(self.batch))
+        expected_eval = Seq2SeqTrainer.compute_loss(trainer, trainer.model, dict(self.batch))
+        self.assertTrue(torch.equal(measured_eval, expected_eval))
+        trainer.log({"eval_loss": measured_eval.item()})
+        self.assertNotIn("mean_weight", trainer.state.log_history[-1])
+        trainer.log({"loss": loss.item()})
+        record = trainer.state.log_history[-1]
+        self.assertEqual(record["weight_samples"], 2)
+        self.assertGreaterEqual(record["mean_weight"], 1)
+        self.assertLessEqual(record["max_weight"], 1.5)
+        self.assertIn("pct_weight_gt_1.1", record)
+        self.assertIn("pct_weight_gt_1.3", record)
+        trainer.log({"train_loss": loss.item()})
+        self.assertNotIn("mean_weight", trainer.state.log_history[-1])
+
+    def test_baseline_logging_has_no_weight_metrics(self):
+        trainer = self.make_trainer(finetuning_args=FinetuningArguments(use_hard_example_loss=False))
+        trainer.log({"loss": 1.0})
+        self.assertNotIn("mean_weight", trainer.state.log_history[-1])
+
     def test_train_evaluate_and_predict_end_to_end_on_cpu(self):
         examples = [
             {k: v[i].clone() for k, v in self.batch.items()}

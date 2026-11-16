@@ -226,8 +226,9 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertTrue(config["load_best_model_at_end"])
         self.assertEqual(config["eval_steps"], 50)
         self.assertEqual(config["save_steps"], 50)
-        self.assertEqual(config["per_device_train_batch_size"], 2)
-        self.assertEqual(config["gradient_accumulation_steps"], 64)
+        self.assertEqual(config["per_device_train_batch_size"], 4)
+        self.assertEqual(config["gradient_accumulation_steps"], 32)
+        self.assertEqual(config["per_device_train_batch_size"] * config["gradient_accumulation_steps"] * 2, 256)
         self.assertEqual(config["lora_rank"], 64)
         self.assertEqual(config["lora_alpha"], 16)
         self.assertEqual(config["quantization_bit"], 4)
@@ -238,7 +239,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["hard_example_loss_alpha"], 0.5)
         self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
-        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep")
+        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep_b4_weights")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
     def test_resume_cell_defaults_off_without_network(self):
@@ -291,7 +292,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(tags["parent_run_id"], namespace["RESUME_RUN_ID"])
         self.assertEqual(tags["initial_global_step"], "338")
         self.assertEqual(tags["initial_epoch"], "2.0")
-        self.assertEqual(tags["variant"], "improved8000_4ep")
+        self.assertEqual(tags["variant"], "improved8000_4ep_b4_weights")
         for target in (2, 1):
             namespace["RESUME_TOTAL_EPOCHS"] = target
             with self.subTest(target=target), self.assertRaises(RuntimeError):
