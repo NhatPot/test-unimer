@@ -163,7 +163,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def log(self, logs, *args, **kwargs):
         stats = getattr(self, "_hard_example_weight_stats", None)
         if stats is not None and ("loss" in logs or "train_loss" in logs):
-            logs = {**logs, **stats.take(self.args.device)}
+            # Trainer.log adds epoch to this same dict, including TrainOutput.metrics.
+            logs.update(stats.take(self.args.device))
         return super().log(logs, *args, **kwargs)
 
     @override

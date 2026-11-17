@@ -1,5 +1,7 @@
 """CPU unit and trainer-integration tests for hard-example-weighted SFT loss."""
 
+import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -20,6 +22,7 @@ if str(LLAMAFACTORY_SRC) not in sys.path:
     sys.path.insert(0, str(LLAMAFACTORY_SRC))
 
 from llamafactory.extras.constants import IGNORE_INDEX  # noqa: E402
+from llamafactory.extras.misc import calculate_tps  # noqa: E402
 from llamafactory.hparams import FinetuningArguments, ModelArguments  # noqa: E402
 from llamafactory.train.sft.hard_example_loss import (  # noqa: E402
     DEFAULT_HARD_EXAMPLE_LOSS_ALPHA,
@@ -831,6 +834,21 @@ class CustomSeq2SeqTrainerHardExampleIntegrationTests(unittest.TestCase):
         trainer.log({"loss": 1.0})
         self.assertNotIn("mean_weight", trainer.state.log_history[-1])
 
+    def test_logging_preserves_epoch_in_callers_metrics_dictionary(self):
+        trainer = self.make_trainer(finetuning_args=FinetuningArguments(use_hard_example_loss=True))
+        trainer.state.epoch = 2.0
+        trainer.model.train()
+        trainer.compute_loss(trainer.model, dict(self.batch))
+        for key in ("loss", "train_loss", "eval_loss"):
+            with self.subTest(key=key):
+                metrics = {key: 0.5}
+                trainer.log(metrics)
+                self.assertEqual(metrics["epoch"], 2.0)
+                if key == "loss":
+                    self.assertEqual(metrics["weight_samples"], 2)
+                else:
+                    self.assertNotIn("mean_weight", metrics)
+
     def test_train_evaluate_and_predict_end_to_end_on_cpu(self):
         examples = [
             {k: v[i].clone() for k, v in self.batch.items()}
@@ -882,6 +900,25 @@ class CustomSeq2SeqTrainerHardExampleIntegrationTests(unittest.TestCase):
         self.assertIn("train_loss", train_result.metrics)
         self.assertTrue(torch.isfinite(torch.tensor(train_result.metrics["train_loss"])).item())
         self.assertFalse(torch.allclose(trainer_on.model.lm_head.weight, initial_head))
+
+        # The workflow calculates TPS and saves these same returned metrics after training.
+        for trainer, result in ((trainer_on, train_result), (trainer_off, trainer_off.train())):
+            with self.subTest(weighted=trainer.finetuning_args.use_hard_example_loss):
+                self.assertEqual(result.metrics["epoch"], 1.0)
+                tps = calculate_tps(dataset, result.metrics, stage="sft")
+                self.assertTrue(math.isfinite(tps))
+                self.assertGreater(tps, 0)
+                result.metrics["effective_tokens_per_sec"] = tps
+                trainer.save_model()
+                trainer.log_metrics("train", result.metrics)
+                trainer.save_metrics("train", result.metrics)
+                trainer.save_state()
+                saved = json.loads((Path(trainer.args.output_dir) / "train_results.json").read_text())
+                self.assertEqual(saved["epoch"], 1.0)
+                self.assertEqual(saved["effective_tokens_per_sec"], tps)
+                state = json.loads((Path(trainer.args.output_dir) / "trainer_state.json").read_text())
+                self.assertEqual(state["global_step"], 1)
+                self.assertEqual(state["epoch"], 1.0)
 
 
 if __name__ == "__main__":

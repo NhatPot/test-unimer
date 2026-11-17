@@ -14,6 +14,9 @@ from unittest import mock
 
 import yaml
 from scripts.prepare_baseline_data import prepare_from_rows
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 from test_prepare_baseline_data import rows
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,22 +36,26 @@ class KaggleNotebookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def namespace(self):
+    def namespace(self, *, resume=False):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             exec(compile(self.sources[1], "cell-1", "exec"), namespace)
-            exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
+            if not resume:
+                source = self.resume_source.replace("USE_DAGSHUB_RESUME = True", "USE_DAGSHUB_RESUME = False")
+            else:
+                source = self.resume_source
+            exec(compile(source, "cell-resume", "exec"), namespace)
         return namespace
 
-    def runtime_namespace(self):
+    def runtime_namespace(self, *, resume=False, num_train_epochs=None):
         project = self.root / "project"
-        (project / "scripts").mkdir(parents=True)
-        (project / "train").mkdir()
+        (project / "scripts").mkdir(parents=True, exist_ok=True)
+        (project / "train").mkdir(exist_ok=True)
         for name in ("scripts/runtime_yaml.py", "scripts/prepare_baseline_data.py",
                      "scripts/dagshub_checkpoint.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
-        namespace = self.namespace()
+        namespace = self.namespace(resume=resume)
         namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable,
                          RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"),
                          OUTPUT_DIR=str(self.root / "output"), BASELINE_DATA_ROOT=str(self.root / "data"))
@@ -64,11 +71,25 @@ class KaggleNotebookTests(unittest.TestCase):
             revisions={"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]},
         )
         namespace["EXPECTED_SPLIT_SHA256"] = result["manifest_sha256"]
+        if num_train_epochs is not None:
+            namespace["_FIXTURE_NUM_TRAIN_EPOCHS"] = num_train_epochs
         return namespace
 
-    def run_runtime(self, namespace):
+    def run_runtime(self, namespace, overrides=None):
+        source = self.sources[6]
+        target_epoch = None
+        if overrides and "num_train_epochs" in overrides:
+            target_epoch = overrides["num_train_epochs"]
+        elif "_FIXTURE_NUM_TRAIN_EPOCHS" in namespace:
+            target_epoch = namespace["_FIXTURE_NUM_TRAIN_EPOCHS"]
+        elif not namespace.get("USE_DAGSHUB_RESUME", False):
+            target_epoch = 2
+
+        if target_epoch is not None:
+            source = source.replace('"num_train_epochs": 4', f'"num_train_epochs": {target_epoch}')
+
         with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()):
-            exec(compile(self.sources[6], "cell-6", "exec"), namespace)
+            exec(compile(source, "cell-6", "exec"), namespace)
             return dict(os.environ)
 
     def bash(self, index, **environment):
@@ -242,9 +263,52 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep_b4_weights")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
-    def test_resume_cell_defaults_off_without_network(self):
+    def test_current_notebook_configuration(self):
+        tree = ast.parse(self.resume_source)
+        assigns = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        try:
+                            assigns[target.id] = ast.literal_eval(node.value)
+                        except Exception:
+                            pass
+        self.assertTrue(assigns.get("USE_DAGSHUB_RESUME"))
+        self.assertEqual(assigns.get("RESUME_RUN_ID"), "b67477dfcc0c402bbff5dda165bba78e")
+        self.assertEqual(assigns.get("RESUME_ARTIFACT_PATH"), "checkpoints/checkpoint-338")
+        self.assertEqual(assigns.get("RESUME_TOTAL_EPOCHS"), 4)
+        self.assertIn('"training/artifact_manifest.json"', self.resume_source)
+        self.assertIn('"checkpoints/checkpoint-338"', self.resume_source)
+
+        tree8 = ast.parse(self.sources[6])
+        settings = next(n.value for n in tree8.body if isinstance(n, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in n.targets))
+        overrides = {k.value: v.value if isinstance(v, ast.Constant) else getattr(v, "id", None)
+                     for k, v in zip(settings.keys, settings.values) if isinstance(k, ast.Constant)}
+        self.assertEqual(overrides["per_device_train_batch_size"], 4)
+        self.assertEqual(overrides["gradient_accumulation_steps"], 32)
+        self.assertEqual(overrides["per_device_train_batch_size"] * overrides["gradient_accumulation_steps"] * 2, 256)
+        self.assertTrue(overrides["use_hard_example_loss"])
+        self.assertEqual(overrides["hard_example_loss_alpha"], 0.5)
+        self.assertEqual(overrides["hard_example_loss_max_weight"], 1.5)
+        self.assertTrue(overrides["load_best_model_at_end"])
+        self.assertEqual(overrides["metric_for_best_model"], "eval_loss")
+        self.assertFalse(overrides["greater_is_better"])
+
+    def test_resume_cell_when_run_training_false_stops_safely_without_network(self):
         with mock.patch("subprocess.run") as run:
-            namespace = self.namespace()
+            with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
+                namespace = {}
+                exec(compile(self.sources[1], "cell-1", "exec"), namespace)
+                self.assertFalse(namespace["RUN_TRAINING"])
+                with self.assertRaisesRegex(RuntimeError, "Resume cần RUN_TRAINING=True để đọc DagsHub Secrets."):
+                    exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
+            run.assert_not_called()
+
+    def test_resume_cell_fresh_fixture_disables_resume_without_network(self):
+        with mock.patch("subprocess.run") as run:
+            namespace = self.namespace(resume=False)
         run.assert_not_called()
         self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
         self.assertIsNone(namespace["RESUME_CHECKPOINT"])
@@ -260,12 +324,13 @@ class KaggleNotebookTests(unittest.TestCase):
             self.assertEqual(command[command.index("--world-size") + 1], "2")
             self.assertIn("--fp16", command)
             self.assertIn("resume-source", command[command.index("--output-dir") + 1])
+            self.assertIn("--manifest-artifact", command)
+            self.assertEqual(command[command.index("--manifest-artifact") + 1], "training/artifact_manifest.json")
             state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-338",
                                          "prepared_output": "/cache/prepared-output"}))
-        source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
         with mock.patch("subprocess.run", side_effect=download), mock.patch.dict(os.environ), \
                 contextlib.redirect_stdout(io.StringIO()):
-            exec(source, namespace)
+            exec(self.resume_source, namespace)
         self.assertEqual(namespace["RESUME_CHECKPOINT"], "/cache/checkpoint-338")
 
     def test_full_resume_runtime_preserves_checkpoint_and_target_epoch(self):
@@ -306,10 +371,14 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
 
     def test_resume_epoch_four_to_six_preserves_full_state_paths_and_training_settings(self):
+        run_id = "51c046b18b5140a080c387416d4828e8"
+        artifact_path = "training/checkpoint-676"
+        total_epochs = 6
         namespace = self.runtime_namespace()
-        self.assertEqual(namespace["RESUME_RUN_ID"], "51c046b18b5140a080c387416d4828e8")
-        self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], "training/checkpoint-676")
-        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 6)
+        namespace.update(RESUME_RUN_ID=run_id, RESUME_ARTIFACT_PATH=artifact_path, RESUME_TOTAL_EPOCHS=total_epochs)
+        self.assertEqual(namespace["RESUME_RUN_ID"], run_id)
+        self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], artifact_path)
+        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], total_epochs)
         checkpoint = self.root / "cache/checkpoint-676"
         checkpoint.mkdir(parents=True)
         for name in ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
