@@ -1,5 +1,6 @@
 """Disk lifecycle tests with tiny fake state files, never Qwen or a remote service."""
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -167,7 +168,6 @@ class CheckpointStorageTests(unittest.TestCase):
         self.assertEqual(storage._files(self.output), before)
 
     def test_actual_cpu_trainer_resumes_optimizer_rng_and_keeps_best_latest(self):
-        import os
         import torch
         from transformers import TrainerCallback
         from test_hard_example_loss import (
@@ -239,6 +239,131 @@ class CheckpointStorageTests(unittest.TestCase):
         self.assertTrue(Path(resumed.state.best_model_checkpoint).is_dir())
         self.assertLessEqual(len(list(output.glob("checkpoint-*"))), 2)
         self.assertEqual(list(current.parent.rglob("optimizer.pt")), [])
+
+    def test_intentional_stop_after_eval_and_save_resumes_same_cosine_horizon(self):
+        import torch
+        from safetensors.torch import load_file
+        from transformers import TrainerCallback
+        from test_hard_example_loss import (
+            CustomSeq2SeqTrainer, DummyProcessor, DummyTokenizer, FinetuningArguments, Seq2SeqTrainingArguments,
+            TinyCausalConfig, TinyCausalPreTrainedModel, TinyDictDataset, collate_batch,
+        )
+
+        dataset = TinyDictDataset([
+            {"input_ids": torch.tensor([1, token, 3, 4]), "attention_mask": torch.ones(4, dtype=torch.long),
+             "labels": torch.tensor([-100, token, 3, 4])}
+            for token in range(2, 10)
+        ])
+
+        class Observe(TrainerCallback):
+            def __init__(self):
+                self.events = []
+                self.learning_rates = []
+
+            def on_train_begin(self, args, state, control, **kwargs):
+                self.initial_step = state.global_step
+                self.scheduler_step = kwargs["lr_scheduler"].last_epoch
+
+            def on_step_end(self, args, state, control, **kwargs):
+                self.learning_rates.append((state.global_step, kwargs["lr_scheduler"].get_last_lr()))
+
+            def on_evaluate(self, args, state, control, **kwargs):
+                self.events.append(("eval", state.global_step))
+
+            def on_save(self, args, state, control, **kwargs):
+                checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+                self.events.append(("save", state.global_step, (checkpoint / "optimizer.pt").is_file()))
+
+        def make_trainer(output, stop_step, observer):
+            args = Seq2SeqTrainingArguments(
+                output_dir=str(output), num_train_epochs=2, per_device_train_batch_size=1,
+                gradient_accumulation_steps=2, use_cpu=True, report_to="none", disable_tqdm=True,
+                save_strategy="steps", eval_strategy="steps", save_steps=1, eval_steps=1, logging_steps=1,
+                save_total_limit=2, load_best_model_at_end=True, metric_for_best_model="score",
+                greater_is_better=True, lr_scheduler_type="cosine", warmup_ratio=.1,
+            )
+            torch.manual_seed(314)
+            with mock.patch.dict(os.environ, STOP_AT_GLOBAL_STEP=stop_step):
+                return CustomSeq2SeqTrainer(
+                    model=TinyCausalPreTrainedModel(TinyCausalConfig()), args=args,
+                    finetuning_args=FinetuningArguments(disable_shuffling=True),
+                    processor=DummyProcessor(), tokenizer=DummyTokenizer(), data_collator=collate_batch,
+                    train_dataset=dataset, eval_dataset=dataset, compute_metrics=lambda _: {"score": 1.0},
+                    callbacks=[observer],
+                )
+
+        control_observer = Observe()
+        uninterrupted = make_trainer(self.root / "uninterrupted", "", control_observer)
+        self.assertEqual(uninterrupted.train().global_step, 8)
+        self.assertNotIn("StopAfterCheckpointCallback", uninterrupted.callback_handler.callback_list)
+
+        parent_output = self.root / "partial"
+        stop_observer = Observe()
+        paused = make_trainer(parent_output, "2", stop_observer)
+        self.assertEqual(paused.train().global_step, 2)
+        self.assertEqual(stop_observer.events[-2:], [("eval", 2), ("save", 2, True)])
+        self.assertEqual(paused.args.max_steps, -1)
+        self.assertEqual(stop_observer.learning_rates, control_observer.learning_rates[:2])
+        checkpoint = parent_output / "checkpoint-2"
+        state = json.loads((checkpoint / "trainer_state.json").read_text())
+        self.assertEqual((state["global_step"], state["epoch"], state["max_steps"]), (2, .5, 8))
+        self.assertEqual(state["num_train_epochs"], 2)
+        self.assertTrue((checkpoint / "rng_state.pth").is_file())
+        self.assertTrue((checkpoint / "scheduler.pt").is_file())
+        best = Path(paused.state.best_model_checkpoint)
+        self.assertEqual(best.name, "checkpoint-1")
+        for name, parameter in load_file(best / "model.safetensors").items():
+            torch.testing.assert_close(paused.model.state_dict()[name], parameter, rtol=0, atol=0)
+
+        resume_observer = Observe()
+        resumed = make_trainer(parent_output, "", resume_observer)
+        with mock.patch.object(resumed, "_load_rng_state", wraps=resumed._load_rng_state) as load_rng:
+            self.assertEqual(resumed.train(resume_from_checkpoint=str(checkpoint)).global_step, 8)
+        self.assertEqual((resume_observer.initial_step, resume_observer.scheduler_step), (2, 2))
+        load_rng.assert_called_with(str(checkpoint))
+        self.assertEqual(resume_observer.learning_rates, control_observer.learning_rates[2:])
+        self.assertEqual(resumed.state.epoch, 2)
+        self.assertEqual(Path(resumed.state.best_model_checkpoint), best)
+        self.assertEqual({p.name for p in parent_output.glob("checkpoint-*")}, {"checkpoint-1", "checkpoint-8"})
+
+    def test_intentional_stop_requires_eval_and_full_save_on_requested_step(self):
+        from llamafactory.train.callbacks import StopAfterCheckpointCallback
+        from transformers import TrainerControl
+
+        state = SimpleNamespace(global_step=0, max_steps=508, save_steps=50, eval_steps=50)
+        args = SimpleNamespace(save_strategy="steps", eval_strategy="steps", save_only_model=False, eval_delay=0)
+        control = TrainerControl()
+        StopAfterCheckpointCallback(250, mock.Mock()).on_train_begin(args, state, control)
+        for wrong_step in (0, 251, 508):
+            with self.subTest(wrong_step=wrong_step), self.assertRaisesRegex(ValueError, "STOP_AT_GLOBAL_STEP"):
+                StopAfterCheckpointCallback(wrong_step, mock.Mock()).on_train_begin(args, state, control)
+        args.save_only_model = True
+        with self.assertRaisesRegex(ValueError, "full checkpoint"):
+            StopAfterCheckpointCallback(250, mock.Mock()).on_train_begin(args, state, control)
+
+    def test_intentional_stop_waits_for_all_ranks_and_checks_fp16_files(self):
+        from llamafactory.train.callbacks import StopAfterCheckpointCallback
+        from transformers import TrainerControl
+
+        checkpoint = self.checkpoint(self.root / "checkpoint-250", step=250)
+        rank_one_rng = checkpoint / "rng_state_1.pth"
+        rank_one_rng.rename(checkpoint / "rank-one.pending")
+        checkpoint.joinpath("scaler.pt").rename(checkpoint / "scaler.pending")
+        args = SimpleNamespace(output_dir=str(self.root), world_size=2, fp16=True)
+        state = SimpleNamespace(global_step=250, max_steps=508, is_world_process_zero=True)
+        control = TrainerControl()
+        callback = StopAfterCheckpointCallback(250, mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, r"rng_state_1.pth, scaler.pt"):
+            callback.on_save(args, state, control)
+        self.assertFalse(control.should_training_stop)
+
+        def finish_rank_saves():
+            checkpoint.joinpath("rank-one.pending").rename(rank_one_rng)
+            checkpoint.joinpath("scaler.pending").rename(checkpoint / "scaler.pt")
+
+        callback.wait_for_everyone.side_effect = finish_rank_saves
+        callback.on_save(args, state, control)
+        self.assertTrue(control.should_training_stop)
 
 
 if __name__ == "__main__":

@@ -268,6 +268,18 @@ def upload_run(
     trainer_state_path = output_dir / "trainer_state.json"
     trainer_state = (json.loads(trainer_state_path.read_text(encoding="utf-8"))
                      if trainer_state_path.is_file() else {})
+    stop_metadata = {}
+    if requested_stop := os.getenv("STOP_AT_GLOBAL_STEP"):
+        stop_step = int(requested_stop)
+        if (latest is None or latest.name != f"checkpoint-{stop_step}"
+                or trainer_state.get("global_step") != stop_step
+                or stop_step >= trainer_state.get("max_steps", 0)):
+            raise RuntimeError("Training output did not reach the requested checkpoint before the training horizon")
+        stop_metadata = {
+            "stopped_intentionally_at_global_step": stop_step,
+            "training_horizon_epochs": trainer_state["num_train_epochs"],
+            "training_horizon_steps": trainer_state["max_steps"],
+        }
     _write_run_files(output_dir, project_dir, {
         "run_uuid": run_uuid, "run_name": run_name,
         "mlflow_run_id": run.info.run_id, "mlflow_experiment_id": experiment.experiment_id,
@@ -282,6 +294,7 @@ def upload_run(
         "final_global_step": trainer_state.get("global_step"),
         "final_epoch": trainer_state.get("epoch"),
         "artifact_verification_level": "sizes_only",
+        **stop_metadata,
     })
     expected = {f"{target}/{path.name}": path.stat().st_size for path, target in configuration}
     expected.update({f"training/{path.relative_to(output_dir).as_posix()}": path.stat().st_size

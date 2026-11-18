@@ -19,7 +19,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 import transformers
@@ -123,6 +124,43 @@ class SaveProcessorCallback(TrainerCallback):
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if args.should_save:
             self.processor.save_pretrained(args.output_dir)
+
+
+class StopAfterCheckpointCallback(TrainerCallback):
+    """End this session at a regular checkpoint without shortening the schedule."""
+
+    def __init__(self, step: int, wait_for_everyone: Callable[[], None]) -> None:
+        self.step = step
+        self.wait_for_everyone = wait_for_everyone
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if not state.global_step < self.step < state.max_steps:
+            raise ValueError("STOP_AT_GLOBAL_STEP must be after the initial step and before the training horizon")
+        if (
+            args.save_strategy != "steps"
+            or args.eval_strategy != "steps"
+            or args.save_only_model
+            or not state.save_steps
+            or not state.eval_steps
+            or self.step % state.save_steps
+            or self.step % state.eval_steps
+            or args.eval_delay > self.step
+        ):
+            raise ValueError("STOP_AT_GLOBAL_STEP must be a scheduled eval and full checkpoint save step")
+
+    @override
+    def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if state.global_step == self.step:
+            # Every rank must finish writing its RNG file before checking the checkpoint.
+            self.wait_for_everyone()
+            if state.is_world_process_zero:
+                from scripts.dagshub_checkpoint import _validate_checkpoint
+
+                checkpoint = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{self.step}"
+                _validate_checkpoint(checkpoint, True, world_size=args.world_size, fp16=args.fp16)
+                logger.info_rank0(f"Stopping this session after saving {checkpoint.name} (horizon {state.max_steps} steps).")
+            control.should_training_stop = True
 
 
 class PissaConvertCallback(TrainerCallback):

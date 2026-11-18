@@ -251,6 +251,7 @@ class BaselineLoggingTests(unittest.TestCase):
         self.assertEqual(metadata["latest_checkpoint"], "checkpoint-5")
         self.assertEqual(metadata["best_checkpoint"], str(checkpoint))
         self.assertEqual(metadata["output_artifact_path"], "training")
+        self.assertNotIn("stopped_intentionally_at_global_step", metadata)
         self.assertEqual(metadata["artifact_verification_level"], "sizes_only")
         self.assertEqual(metadata["tags"]["experiment_variant"], "baseline")
         self.assertEqual(metadata["tags"]["baseline_label"], "dev_tt")
@@ -264,6 +265,30 @@ class BaselineLoggingTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_TOKEN", captured.getvalue())
         self.assertIn("https://example.org/repo.mlflow/#/experiments/17/runs/", captured.getvalue())
         self.assertIn("sizes_only", captured.getvalue())
+
+    def test_intentional_stop_upload_preserves_horizon_and_hashes_checkpoint(self):
+        checkpoint = self.checkpoint("checkpoint-250")
+        trainer_state = {"global_step": 250, "epoch": .984, "num_train_epochs": 2, "max_steps": 508}
+        (self.output / "trainer_state.json").write_text(json.dumps(trainer_state))
+        os.environ["STOP_AT_GLOBAL_STEP"] = "250"
+        self.upload()
+        metadata = json.loads(self.sdk.client.files["training/run_metadata.json"])
+        self.assertEqual(metadata["stopped_intentionally_at_global_step"], 250)
+        self.assertEqual(metadata["final_global_step"], 250)
+        self.assertEqual(metadata["training_horizon_epochs"], 2)
+        self.assertEqual(metadata["training_horizon_steps"], 508)
+        self.assertEqual(metadata["latest_checkpoint"], "checkpoint-250")
+        manifest = json.loads(self.sdk.client.files["training/artifact_manifest.json"])
+        files = {item["path"]: item["sha256"] for item in manifest["files"]}
+        self.assertEqual(files["checkpoint-250/optimizer.pt"], self.logger._sha256(checkpoint / "optimizer.pt"))
+
+    def test_intentional_stop_upload_refuses_checkpoint_from_different_step(self):
+        self.checkpoint("checkpoint-249")
+        (self.output / "trainer_state.json").write_text('{"global_step": 250, "max_steps": 508}')
+        os.environ["STOP_AT_GLOBAL_STEP"] = "250"
+        with self.assertRaisesRegex(RuntimeError, "requested checkpoint"):
+            self.upload()
+        self.assertEqual(self.sdk.uploads, [])
 
     def test_nonempty_stale_artifacts_do_not_verify_upload(self):
         self.sdk.client.files["training/old.bin"] = b"old"

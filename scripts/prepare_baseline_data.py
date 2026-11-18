@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, closing
+import gzip
 import hashlib
 import io
 from itertools import islice
@@ -40,14 +41,67 @@ def _image(value):
     return key, image
 
 
-def _settings(names, max_samples, val_ratio, seed):
+def _settings(names, max_samples, val_ratio, seed, *, max_samples_by_source=None):
     if type(max_samples) is not int or max_samples < 2:
         raise ValueError("max_samples must be at least 2 per source")
     if type(seed) is not int or not isinstance(names, list) or not names or len(set(names)) != len(names):
         raise ValueError("Provide distinct dataset names and an integer seed")
     if type(val_ratio) not in (int, float) or not math.isfinite(val_ratio) or not 0 < val_ratio < 1:
         raise ValueError("val_ratio must be between 0 and 1")
-    return dict(datasets=names, max_samples=max_samples, val_ratio=val_ratio, seed=seed)
+    settings = dict(datasets=names, max_samples=max_samples, val_ratio=val_ratio, seed=seed)
+    if max_samples_by_source is not None:
+        if (not isinstance(max_samples_by_source, dict)
+                or any(name not in names or type(cap) is not int or cap < 2
+                       for name, cap in max_samples_by_source.items())):
+            raise ValueError("Per-source caps must map selected dataset names to integers of at least 2")
+        if max_samples_by_source:
+            settings["max_samples_by_source"] = max_samples_by_source
+    return settings
+
+
+def _read_base_manifest(path, expected_sha256, settings):
+    if path is None:
+        if expected_sha256 is not None:
+            raise ValueError("A base manifest SHA256 requires a base manifest path")
+        return None
+    path = require_regular_path(Path(path))
+    content = path.read_bytes()
+    if path.suffix == ".gz":
+        content = gzip.decompress(content)
+    digest = hashlib.sha256(content).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError("Base split manifest SHA256 differs from the expected SHA256")
+    manifest = json.loads(content)
+    if (manifest.get("schema_version") != 1
+            or manifest.get("grouping") != "source_family_id_or_decoded_rgb_sha256"
+            or not isinstance(manifest.get("records"), list) or not manifest["records"]):
+        raise ValueError("Base split manifest must be an image-grouped manifest with records")
+    settings["base_manifest_sha256"] = digest
+    return manifest
+
+
+def _inherited_splits(base_manifest, records, find):
+    base_rows = {(r["source"], r["row"]): r for r in base_manifest["records"]}
+    if len(base_rows) != len(base_manifest["records"]):
+        raise ValueError("Duplicate source/row in base split manifest")
+    splits = {}
+    for item in records:
+        key = (item["source"], item["row"])
+        old = base_rows.pop(key, None)
+        if old is None:
+            continue
+        if (item["image_sha256"], item["source_id"]) != (old["image_sha256"], old["source_id"]):
+            raise ValueError(f"Base split record changed: {key}")
+        split = old["split"]
+        if split not in ("train", "val"):
+            raise ValueError(f"Invalid base split for record: {key}")
+        group = find(item["image_sha256"])
+        if splits.setdefault(group, split) != split:
+            raise ValueError(f"Image group {group} joins both base train and validation records")
+    if base_rows:
+        key = next(iter(base_rows))
+        raise ValueError(f"Base split record missing from selected sources: {key}")
+    return splits
 
 
 def _result(directory, manifest):
@@ -71,20 +125,36 @@ def reuse_prepared(directory, settings):
 
 
 def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
-                      val_ratio=0.1, seed=42, revisions=None):
-    """Read at most max_samples rows per source, then split whole image groups.
+                      val_ratio=0.1, seed=42, revisions=None, max_samples_by_source=None,
+                      base_manifest=None, base_manifest_sha256=None):
+    """Apply source-specific caps or max_samples, then split whole image groups.
 
     Same decoded RGB pixels are grouped even if encoded bytes differ. Matching
     source IDs within the same dataset family also join groups. This is not a
     perceptual detector for cropped/altered duplicates; source lineage matters.
+    With a base manifest, only groups with no historical records are shuffled.
     """
-    names = list(rows_by_source)
-    settings = _settings(names, max_samples, val_ratio, seed)
+    settings = _settings(list(rows_by_source), max_samples, val_ratio, seed,
+                         max_samples_by_source=max_samples_by_source)
     settings["source_entries"] = entries
+    base = _read_base_manifest(base_manifest, base_manifest_sha256, settings)
     directory = require_regular_path(Path(directory))
     cached = reuse_prepared(directory, settings)
     if cached:
         return cached
+    return _prepare_from_rows(directory, rows_by_source, settings, revisions or {}, base)
+
+
+def _prepare_from_rows(directory, rows_by_source, settings, revisions, base):
+    entries = settings["source_entries"]
+    source_caps = settings.get("max_samples_by_source", {})
+    if base is not None:
+        for name, entry in base["settings"]["source_entries"].items():
+            if entries.get(name) != entry:
+                raise ValueError(f"Base split source registry changed or source is missing: {name}")
+        for repo, revision in base["source_revisions"].items():
+            if revisions.get(repo) != revision:
+                raise ValueError(f"Base split source revision changed: {repo}")
     directory.parent.mkdir(parents=True, exist_ok=True)
     lock = directory.with_name(directory.name + ".building")
     lock.mkdir()  # A stale build requires inspection, never replacement.
@@ -114,7 +184,8 @@ def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
             image_column = entry["columns"]["images"]
             messages_column = entry["columns"]["messages"]
             selected = 0
-            for index, row in enumerate(islice(rows, max_samples)):
+            limit = source_caps.get(name, settings["max_samples"])
+            for index, row in enumerate(islice(rows, limit)):
                 messages = row.get(messages_column)
                 if not isinstance(messages, list) or not messages:
                     raise ValueError(f"Missing conversations in source {name}, row {index}")
@@ -140,11 +211,21 @@ def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
         groups = sorted({find(item["image_sha256"]) for item in records})
         if len(groups) < 2:
             raise ValueError("Need at least two independent image groups")
-        random.Random(seed).shuffle(groups)
-        n_val = min(len(groups) - 1, max(1, round(len(groups) * val_ratio)))
-        val_groups = set(groups[:n_val])
+        if base is None:
+            random.Random(settings["seed"]).shuffle(groups)
+            n_val = min(len(groups) - 1, max(1, round(len(groups) * settings["val_ratio"])))
+            val_groups = set(groups[:n_val])
+        else:
+            inherited = _inherited_splits(base, records, find)
+            new_groups = [group for group in groups if group not in inherited]
+            random.Random(settings["seed"]).shuffle(new_groups)
+            n_new_val = round(len(new_groups) * settings["val_ratio"])
+            val_groups = {group for group, split in inherited.items() if split == "val"}
+            val_groups.update(new_groups[:n_new_val])
+            if not 0 < len(val_groups) < len(groups):
+                raise ValueError("Need both training and validation image groups")
         train, val, membership = [], [], []
-        counts = {name: Counter() for name in names}
+        counts = {name: Counter() for name in settings["datasets"]}
         for item in records:
             group = find(item["image_sha256"])
             split = "val" if group in val_groups else "train"
@@ -156,11 +237,11 @@ def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
         _json(staging / "train.json", train)
         _json(staging / "val.json", val)
         _json(staging / "dataset_info.json", registry)
-        manifest = dict(schema_version=1, settings=settings, source_revisions=revisions or {},
+        manifest = dict(schema_version=1, settings=settings, source_revisions=revisions,
                         grouping="source_family_id_or_decoded_rgb_sha256",
                         counts=dict(train_rows=len(train), val_rows=len(val),
                                     unique_images=len({r["image_sha256"] for r in membership}),
-                                    train_groups=len(groups)-n_val, val_groups=n_val,
+                                    train_groups=len(groups)-len(val_groups), val_groups=len(val_groups),
                                     image_group_overlap=0, by_source={k:dict(v) for k,v in counts.items()}),
                         records=membership,
                         files={p.relative_to(staging).as_posix(): sha256_file(p)
@@ -175,12 +256,15 @@ def prepare_from_rows(directory, rows_by_source, entries, *, max_samples=1000,
 
 
 def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val_ratio=0.1, seed=42,
-                     dataset_revision=None):
+                     dataset_revision=None, max_samples_by_source=None,
+                     base_manifest=None, base_manifest_sha256=None):
     names = [name.strip() for name in datasets.split(",") if name.strip()]
-    settings = _settings(names, max_samples, val_ratio, seed)
+    settings = _settings(names, max_samples, val_ratio, seed,
+                         max_samples_by_source=max_samples_by_source)
     registry = json.loads((Path(project_dir) / "train/dataset_info.json").read_text(encoding="utf-8"))
     entries = {name: registry[name] for name in names}
     settings["source_entries"] = entries
+    base = _read_base_manifest(base_manifest, base_manifest_sha256, settings)
     output_dir = require_regular_path(Path(output_dir))
     cached = reuse_prepared(output_dir, settings)
     if cached:
@@ -194,6 +278,7 @@ def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val
     from huggingface_hub import HfApi
     revisions = {repo: HfApi().dataset_info(repo, revision=dataset_revision).sha
                  for repo in {e["hf_hub_url"] for e in entries.values()}}
+    source_caps = settings.get("max_samples_by_source", {})
     with ExitStack() as readers:
         rows = {}
         for name, entry in entries.items():
@@ -203,9 +288,9 @@ def prepare_baseline(project_dir, datasets, output_dir, *, max_samples=1000, val
                 raise ValueError("Baseline preparation requires Parquet sources")
             files = builder.config.data_files[entry.get("split", "train")]
             columns = [entry["columns"]["messages"], entry["columns"]["images"]]
-            rows[name] = readers.enter_context(closing(_parquet_rows(files, columns, max_samples)))
-        return prepare_from_rows(output_dir, rows, entries, max_samples=max_samples,
-                                 val_ratio=val_ratio, seed=seed, revisions=revisions)
+            limit = source_caps.get(name, max_samples)
+            rows[name] = readers.enter_context(closing(_parquet_rows(files, columns, limit)))
+        return _prepare_from_rows(output_dir, rows, settings, revisions, base)
 
 
 def _parquet_rows(files, columns, limit):
@@ -234,10 +319,13 @@ def main(argv=None):
     parser.add_argument("--datasets")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-samples", type=int, default=1000)
+    parser.add_argument("--max-samples-by-source", type=json.loads)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset-revision")
     parser.add_argument("--expected-manifest-sha256")
+    parser.add_argument("--base-manifest", help="Original image-grouped manifest (.json or .json.gz)")
+    parser.add_argument("--base-manifest-sha256", help="SHA256 of the original, uncompressed manifest")
     parser.add_argument("--base-yaml")
     parser.add_argument("--runtime-yaml")
     parser.add_argument("--overrides-json")
@@ -270,11 +358,17 @@ def main(argv=None):
     names = overrides["dataset"] if overrides is not None else args.datasets
     if not names:
         raise ValueError("Dataset names are required")
+    source_caps = args.max_samples_by_source
+    if overrides is not None:
+        source_caps = overrides.pop("max_samples_by_source", source_caps)
+    base_manifest = Path(args.project_dir) / args.base_manifest if args.base_manifest else None
     result = prepare_baseline(args.project_dir, names, args.output_dir,
                               max_samples=overrides.get("max_samples", 1000) if overrides else args.max_samples,
+                              max_samples_by_source=source_caps,
                               val_ratio=overrides.get("val_size", .1) if overrides else args.val_ratio,
                               seed=overrides.get("seed", 42) if overrides else args.seed,
-                              dataset_revision=args.dataset_revision)
+                              dataset_revision=args.dataset_revision, base_manifest=base_manifest,
+                              base_manifest_sha256=args.base_manifest_sha256)
     if args.expected_manifest_sha256 and result["manifest_sha256"] != args.expected_manifest_sha256:
         raise ValueError("Split manifest differs from baseline; training configuration was not published")
     if overrides is not None:

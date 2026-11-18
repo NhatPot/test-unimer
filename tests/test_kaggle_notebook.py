@@ -1,6 +1,8 @@
 """Contracts for the simplified notebook. Never execute setup/install/train."""
 import ast
 import contextlib
+import gzip
+import hashlib
 import io
 import json
 import os
@@ -36,18 +38,21 @@ class KaggleNotebookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def namespace(self, *, resume=False):
+    def namespace(self):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             exec(compile(self.sources[1], "cell-1", "exec"), namespace)
-            if not resume:
-                source = self.resume_source.replace("USE_DAGSHUB_RESUME = True", "USE_DAGSHUB_RESUME = False")
-            else:
-                source = self.resume_source
-            exec(compile(source, "cell-resume", "exec"), namespace)
+            exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
         return namespace
 
-    def runtime_namespace(self, *, resume=False, num_train_epochs=None):
+    def runtime_overrides(self):
+        settings = next(node.value for node in ast.parse(self.sources[6]).body
+                        if isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in node.targets))
+        return {key.value: ast.literal_eval(value)
+                for key, value in zip(settings.keys, settings.values) if key.value != "output_dir"}
+
+    def runtime_namespace(self):
         project = self.root / "project"
         (project / "scripts").mkdir(parents=True, exist_ok=True)
         (project / "train").mkdir(exist_ok=True)
@@ -55,41 +60,32 @@ class KaggleNotebookTests(unittest.TestCase):
                      "scripts/dagshub_checkpoint.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
-        namespace = self.namespace(resume=resume)
+        namespace = self.namespace()
         namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable,
                          RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"),
                          OUTPUT_DIR=str(self.root / "output"), BASELINE_DATA_ROOT=str(self.root / "data"))
         registry = json.loads((project / "train/dataset_info.json").read_text())
-        tree = ast.parse(self.sources[6])
-        settings = next(n.value for n in tree.body if isinstance(n, ast.Assign)
-                        and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in n.targets))
-        names = ast.literal_eval(settings.values[0]).split(", ")
-        prepared = Path(namespace["BASELINE_DATA_ROOT"]) / "n8000-v0.1-s42"
+        settings = self.runtime_overrides()
+        names = settings["dataset"].split(", ")
+        source_rows = {name: rows() for name in names if name != "parquet_mathwriting_train"}
+        revisions = {"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]}
+        base = prepare_from_rows(self.root / "base", source_rows, {name: registry[name] for name in source_rows},
+                                 max_samples=settings["max_samples"], revisions=revisions)
+        namespace.update(BASE_SPLIT_MANIFEST=base["manifest_path"], BASE_SPLIT_SHA256=base["manifest_sha256"])
+        source_rows["parquet_hme100k_train"] = rows(25)
+        source_rows["parquet_mathwriting_train"] = rows(22, offset=100)
+        prepared = Path(namespace["BASELINE_DATA_ROOT"]) / namespace["RUN_VARIANT"]
         result = prepare_from_rows(
-            prepared, {name:rows() for name in names}, {name:registry[name] for name in names},
-            max_samples=8000,
-            revisions={"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]},
+            prepared, source_rows, {name: registry[name] for name in names}, revisions=revisions,
+            max_samples=settings["max_samples"], max_samples_by_source=settings["max_samples_by_source"],
+            base_manifest=base["manifest_path"], base_manifest_sha256=base["manifest_sha256"],
         )
-        namespace["EXPECTED_SPLIT_SHA256"] = result["manifest_sha256"]
-        if num_train_epochs is not None:
-            namespace["_FIXTURE_NUM_TRAIN_EPOCHS"] = num_train_epochs
+        namespace["RESUME_SPLIT_SHA256"] = result["manifest_sha256"]
         return namespace
 
-    def run_runtime(self, namespace, overrides=None):
-        source = self.sources[6]
-        target_epoch = None
-        if overrides and "num_train_epochs" in overrides:
-            target_epoch = overrides["num_train_epochs"]
-        elif "_FIXTURE_NUM_TRAIN_EPOCHS" in namespace:
-            target_epoch = namespace["_FIXTURE_NUM_TRAIN_EPOCHS"]
-        elif not namespace.get("USE_DAGSHUB_RESUME", False):
-            target_epoch = 2
-
-        if target_epoch is not None:
-            source = source.replace('"num_train_epochs": 4', f'"num_train_epochs": {target_epoch}')
-
+    def run_runtime(self, namespace):
         with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()):
-            exec(compile(source, "cell-6", "exec"), namespace)
+            exec(compile(self.sources[6], "cell-6", "exec"), namespace)
             return dict(os.environ)
 
     def bash(self, index, **environment):
@@ -139,6 +135,14 @@ class KaggleNotebookTests(unittest.TestCase):
                          "PIPELINE_REVIEW_COMPLETE", "SOURCE_COMMIT",
                          "MINICONDA_INSTALLER_SHA256"):
             self.assertNotIn(obsolete, namespace)
+
+    def test_session_one_exports_stop_step_and_session_two_clears_it(self):
+        with mock.patch.dict(os.environ, STOP_AT_GLOBAL_STEP="stale"), contextlib.redirect_stdout(io.StringIO()):
+            exec(self.sources[1], {})
+            self.assertEqual(os.environ["STOP_AT_GLOBAL_STEP"], "250")
+            resume_config = self.sources[1].replace("STOP_AT_GLOBAL_STEP = 250", "STOP_AT_GLOBAL_STEP = None")
+            exec(resume_config, {})
+            self.assertEqual(os.environ["STOP_AT_GLOBAL_STEP"], "")
 
     def test_session_rerun_retains_uuid_and_clears_stale_config_secret(self):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
@@ -201,7 +205,7 @@ class KaggleNotebookTests(unittest.TestCase):
 
     def test_pinned_split_mismatch_blocks_runtime_before_train(self):
         namespace = self.runtime_namespace()
-        namespace["EXPECTED_SPLIT_SHA256"] = "0" * 64
+        namespace["BASE_SPLIT_SHA256"] = "0" * 64
         with self.assertRaises(RuntimeError):
             self.run_runtime(namespace)
         self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
@@ -252,63 +256,81 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["per_device_train_batch_size"] * config["gradient_accumulation_steps"] * 2, 256)
         self.assertEqual(config["lora_rank"], 64)
         self.assertEqual(config["lora_alpha"], 16)
+        self.assertEqual(config["lora_dropout"], .05)
         self.assertEqual(config["quantization_bit"], 4)
+        self.assertEqual(config["quantization_type"], "nf4")
         self.assertEqual(config["image_max_pixels"], 262144)
         self.assertEqual(config["cutoff_len"], 2048)
         self.assertFalse(config["overwrite_output_dir"])
-        self.assertTrue(config["use_hard_example_loss"])
+        self.assertFalse(config["use_hard_example_loss"])
         self.assertEqual(config["hard_example_loss_alpha"], 0.5)
         self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
-        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "improved8000_2ep_b4_weights")
+        self.assertNotIn("max_samples_by_source", config)
+        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "K1_datascale_sft")
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
 
     def test_current_notebook_configuration(self):
-        tree = ast.parse(self.resume_source)
-        assigns = {}
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        try:
-                            assigns[target.id] = ast.literal_eval(node.value)
-                        except Exception:
-                            pass
-        self.assertTrue(assigns.get("USE_DAGSHUB_RESUME"))
-        self.assertEqual(assigns.get("RESUME_RUN_ID"), "b67477dfcc0c402bbff5dda165bba78e")
-        self.assertEqual(assigns.get("RESUME_ARTIFACT_PATH"), "checkpoints/checkpoint-338")
-        self.assertEqual(assigns.get("RESUME_TOTAL_EPOCHS"), 4)
+        namespace = self.namespace()
+        self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
+        self.assertEqual(namespace["RESUME_RUN_ID"], "")
+        self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], "")
+        self.assertEqual(namespace["RESUME_SPLIT_SHA256"], "")
+        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 2)
         self.assertIn('"training/artifact_manifest.json"', self.resume_source)
-        self.assertIn('"checkpoints/checkpoint-338"', self.resume_source)
 
-        tree8 = ast.parse(self.sources[6])
-        settings = next(n.value for n in tree8.body if isinstance(n, ast.Assign)
-                        and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in n.targets))
-        overrides = {k.value: v.value if isinstance(v, ast.Constant) else getattr(v, "id", None)
-                     for k, v in zip(settings.keys, settings.values) if isinstance(k, ast.Constant)}
+        overrides = self.runtime_overrides()
+        sources = [
+            "parquet_crohme_train", "parquet_crohme_train_can", "parquet_crohme_train_tree",
+            "parquet_crohme_train_error_find", "parquet_crohme_train_error_fix",
+            "parquet_hme100k_train", "parquet_mathwriting_train",
+        ]
+        self.assertEqual(overrides["dataset"].split(", "), sources)
+        self.assertEqual(overrides["max_samples"], 8000)
+        self.assertEqual(overrides["max_samples_by_source"],
+                         {"parquet_hme100k_train": 16000, "parquet_mathwriting_train": 16000})
+        self.assertEqual(overrides["num_train_epochs"], 2)
         self.assertEqual(overrides["per_device_train_batch_size"], 4)
         self.assertEqual(overrides["gradient_accumulation_steps"], 32)
         self.assertEqual(overrides["per_device_train_batch_size"] * overrides["gradient_accumulation_steps"] * 2, 256)
-        self.assertTrue(overrides["use_hard_example_loss"])
+        self.assertFalse(overrides["use_hard_example_loss"])
         self.assertEqual(overrides["hard_example_loss_alpha"], 0.5)
         self.assertEqual(overrides["hard_example_loss_max_weight"], 1.5)
         self.assertTrue(overrides["load_best_model_at_end"])
         self.assertEqual(overrides["metric_for_best_model"], "eval_loss")
         self.assertFalse(overrides["greater_is_better"])
+        self.assertEqual(overrides["save_total_limit"], 2)
+
+    def test_packaged_base_manifest_matches_registry_and_pinned_revision(self):
+        namespace = self.namespace()
+        original = gzip.decompress((ROOT / namespace["BASE_SPLIT_MANIFEST"]).read_bytes())
+        self.assertEqual(hashlib.sha256(original).hexdigest(),
+                         "a3ffe3480ceaafcaebf96f31102e9f97dadd9effc56ca235dc573cb0ff00a11a")
+        self.assertEqual(hashlib.sha256(original).hexdigest(), namespace["BASE_SPLIT_SHA256"])
+        base = json.loads(original)
+        self.assertEqual(len(base["records"]), 48000)
+        self.assertEqual(base["source_revisions"], {"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]})
+        registry = json.loads((ROOT / "train/dataset_info.json").read_text())
+        self.assertEqual(base["settings"]["source_entries"],
+                         {name: registry[name] for name in base["settings"]["datasets"]})
+        mathwriting = registry["parquet_mathwriting_train"]
+        self.assertEqual(mathwriting["subset"], "mathwriting_train")
+        self.assertEqual(mathwriting["columns"], {"messages": "conversations", "images": "image"})
 
     def test_resume_cell_when_run_training_false_stops_safely_without_network(self):
+        source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
         with mock.patch("subprocess.run") as run:
             with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
                 namespace = {}
                 exec(compile(self.sources[1], "cell-1", "exec"), namespace)
                 self.assertFalse(namespace["RUN_TRAINING"])
                 with self.assertRaisesRegex(RuntimeError, "Resume cần RUN_TRAINING=True để đọc DagsHub Secrets."):
-                    exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
+                    exec(compile(source, "cell-resume", "exec"), namespace)
             run.assert_not_called()
 
-    def test_resume_cell_fresh_fixture_disables_resume_without_network(self):
+    def test_resume_cell_k1_defaults_to_fresh_without_network(self):
         with mock.patch("subprocess.run") as run:
-            namespace = self.namespace(resume=False)
+            namespace = self.namespace()
         run.assert_not_called()
         self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
         self.assertIsNone(namespace["RESUME_CHECKPOINT"])
@@ -319,6 +341,11 @@ class KaggleNotebookTests(unittest.TestCase):
                          PROJECT_DIR=str(self.root), PYTHON="/own-env/bin/python")
         state = self.root / "run/resume_checkpoint.json"
         state.parent.mkdir()
+        source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
+        for name, value in (("RESUME_RUN_ID", "a" * 32), ("RESUME_ARTIFACT_PATH", "checkpoints/checkpoint-250"),
+                            ("RESUME_SPLIT_SHA256", "b" * 64)):
+            source = source.replace(f'{name} = ""', f'{name} = "{value}"')
+
         def download(command, **kwargs):
             self.assertEqual(command[0], "/own-env/bin/python")
             self.assertEqual(command[command.index("--world-size") + 1], "2")
@@ -326,42 +353,47 @@ class KaggleNotebookTests(unittest.TestCase):
             self.assertIn("resume-source", command[command.index("--output-dir") + 1])
             self.assertIn("--manifest-artifact", command)
             self.assertEqual(command[command.index("--manifest-artifact") + 1], "training/artifact_manifest.json")
-            state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-338",
+            state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-250",
                                          "prepared_output": "/cache/prepared-output"}))
         with mock.patch("subprocess.run", side_effect=download), mock.patch.dict(os.environ), \
                 contextlib.redirect_stdout(io.StringIO()):
-            exec(self.resume_source, namespace)
-        self.assertEqual(namespace["RESUME_CHECKPOINT"], "/cache/checkpoint-338")
+            exec(source, namespace)
+        self.assertEqual(namespace["RESUME_CHECKPOINT"], "/cache/checkpoint-250")
 
     def test_full_resume_runtime_preserves_checkpoint_and_target_epoch(self):
         namespace = self.runtime_namespace()
-        checkpoint = self.root / "cache/checkpoint-338"
+        checkpoint = self.root / "cache/checkpoint-250"
         checkpoint.mkdir(parents=True)
         for name in ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
                      "scheduler.pt", "scaler.pt", "rng_state_0.pth", "rng_state_1.pth"):
             (checkpoint / name).write_bytes(b"fixture only; never unpickle")
-        (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 338, "epoch": 2.0}))
-        namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint), RESUME_TOTAL_EPOCHS=4)
+        (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 250, "epoch": .984}))
+        namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint),
+                         RESUME_RUN_ID="a" * 32, RESUME_ARTIFACT_PATH="checkpoints/checkpoint-250")
         env = self.run_runtime(namespace)
         config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertEqual(config["resume_from_checkpoint"], str(checkpoint))
         self.assertEqual(config["adapter_name_or_path"], str(checkpoint))
         self.assertFalse(config["create_new_adapter"])
-        self.assertEqual(config["num_train_epochs"], 4)
+        self.assertEqual(config["num_train_epochs"], 2)
         self.assertEqual(config["max_steps"], -1)
         self.assertEqual(config["lr_scheduler_type"], "cosine")
         self.assertEqual(config["warmup_ratio"], .1)
-        self.assertTrue(config["use_hard_example_loss"])
+        self.assertFalse(config["use_hard_example_loss"])
         self.assertFalse(Path(namespace["OUTPUT_DIR"]).exists())
         tags = json.loads(env["MLFLOW_TAGS"])
         self.assertEqual(tags["parent_run_id"], namespace["RESUME_RUN_ID"])
-        self.assertEqual(tags["initial_global_step"], "338")
-        self.assertEqual(tags["initial_epoch"], "2.0")
-        self.assertEqual(tags["variant"], "improved8000_4ep_b4_weights")
-        for target in (2, 1):
+        self.assertEqual(tags["initial_global_step"], "250")
+        self.assertEqual(tags["initial_epoch"], "0.984")
+        self.assertEqual(tags["variant"], "K1_datascale_sft")
+        for target in (.984, .5):
             namespace["RESUME_TOTAL_EPOCHS"] = target
             with self.subTest(target=target), self.assertRaises(RuntimeError):
                 self.run_runtime(namespace)
+        namespace.update(RESUME_TOTAL_EPOCHS=2, RESUME_SPLIT_SHA256="0" * 64)
+        with self.assertRaises(RuntimeError):
+            self.run_runtime(namespace)
+        self.assertEqual(yaml.safe_load(Path(env["YAML_CONFIG"]).read_text()), config)
 
     def test_enabled_resume_without_download_does_not_fall_back_to_fresh(self):
         namespace = self.runtime_namespace()
@@ -484,10 +516,12 @@ class KaggleNotebookTests(unittest.TestCase):
         result = self.bash(8, RUN_TRAINING="1", PROJECT_DIR=str(self.root),
                            YAML_CONFIG="runtime.yaml", OUTPUT_DIR=str(self.root / "new"),
                            PYTHON=str(fake), RUN_UUID="a"*32, SYNC_STATE_PATH="run/state.json",
-                           MLFLOW_EXPERIMENT_NAME="experiment", CALLS=str(calls))
+                           MLFLOW_EXPERIMENT_NAME="experiment", EXPERIMENT_VARIANT="K1_datascale_sft",
+                           CALLS=str(calls))
         self.assertEqual(result.returncode, 0, result.stderr)
         args = calls.read_text().splitlines()
         self.assertEqual(args[0], "scripts/train_with_checkpoint_sync.py")
+        self.assertEqual(args[args.index("--run-name") + 1], "K1_datascale_sft-" + "a" * 32)
         self.assertEqual(args[args.index("--state-path") + 1], "run/state.json")
 
     def test_no_shared_benchmark_upload_or_new_pipeline_claim(self):

@@ -1,3 +1,5 @@
+import gzip
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -6,6 +8,7 @@ import subprocess
 import sys
 import unittest
 from unittest import mock
+from collections import Counter
 from contextlib import closing
 
 from PIL import Image
@@ -64,6 +67,106 @@ class BaselineDataTests(unittest.TestCase):
         self.assertEqual(len(self.manifest()["records"]), 20)
         for counts in self.manifest()["counts"]["by_source"].values():
             self.assertEqual(sum(counts.values()), 10)
+
+    def test_scalar_cap_manifest_matches_pre_k1_bytes(self):
+        self.sources = {"hmer": rows(6), "count": rows(6)}
+        self.prepare(max_samples=4)
+        raw = (self.output / "split_manifest.json").read_bytes()
+        files = json.loads(raw)["files"]
+        # Captured at f9af2bf with this fixture. Only train/val hashes depend
+        # on the temporary absolute path, so verify those payloads separately.
+        for split, indices, placeholder in (("train", (0, 1, 3), b"0"), ("val", (2,), b"1")):
+            expected = []
+            for source_rows in self.sources.values():
+                for index in indices:
+                    row = source_rows[index]
+                    pixels = bytes((index, 20, 30)) * 16
+                    key = hashlib.sha256(b"RGB:4:4:" + pixels).hexdigest()
+                    expected.append({"conversations": row["conversations"],
+                                     "image": [str(self.output / "images" / f"{key}.png")]})
+            payload = (json.dumps(expected, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+            self.assertEqual((self.output / f"{split}.json").read_bytes(), payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            self.assertEqual(files[f"{split}.json"], digest)
+            raw = raw.replace(digest.encode(), placeholder * 64)
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                         "fb7a34f32a38e579796124c4e495e34f0945dfb9efc553b46a19a19c15373eab")
+
+    def test_per_source_caps_override_fallback_without_reading_past_either(self):
+        def stream(n, offset):
+            yield from rows(n, offset=offset)
+            raise AssertionError("read past source cap")
+
+        self.sources = {"hmer": stream(5, 0), "count": stream(3, 0)}
+        self.prepare(max_samples=3, max_samples_by_source={"hmer": 5})
+        self.assertEqual(Counter(r["source"] for r in self.manifest()["records"]),
+                         {"hmer": 5, "count": 3})
+        self.assertEqual(self.manifest()["settings"]["max_samples_by_source"], {"hmer": 5})
+
+    def test_per_source_caps_reject_unknown_names_and_invalid_values(self):
+        for caps in ({"unknown": 5}, {"hmer": True}, {"hmer": 1}, {"hmer": 2.0}, [("hmer", 5)]):
+            with self.subTest(caps=caps), self.assertRaisesRegex(ValueError, "Per-source caps"):
+                self.prepare(max_samples_by_source=caps)
+        self.assertFalse(self.output.exists())
+
+    def test_expansion_preserves_every_base_record_and_splits_only_new_groups(self):
+        original = self.prepare(max_samples=20)
+        old = self.manifest()
+        archive = self.root / "base.json.gz"
+        archive.write_bytes(gzip.compress(Path(original["manifest_path"]).read_bytes(), mtime=0))
+        base_records = {(r["source"], r["row"]): r for r in old["records"]}
+        val_record = next(r for r in old["records"] if r["split"] == "val")
+        train_record = next(r for r in old["records"] if r["split"] == "train")
+        self.sources["hmer"] = rows(40)
+        self.sources["new"] = rows(30, offset=128)
+        for row, original_record in zip(self.sources["new"], (val_record, train_record)):
+            row["image"] = self.sources[original_record["source"]][original_record["row"]]["image"]
+        self.entries["new"] = entry("mathwriting_train")
+        args = dict(max_samples=20, max_samples_by_source={"hmer": 40, "new": 30},
+                    base_manifest=archive, base_manifest_sha256=original["manifest_sha256"])
+        self.output = self.root / "expanded"
+        self.prepare(**args)
+        expanded = self.manifest()
+        self.assertEqual(expanded["settings"]["base_manifest_sha256"], original["manifest_sha256"])
+        splits_by_group = {}
+        for r in expanded["records"]:
+            splits_by_group.setdefault(r["group"], set()).add(r["split"])
+        current_records = {(r["source"], r["row"]): r for r in expanded["records"]}
+        for key, record in base_records.items():
+            self.assertEqual(current_records[key]["split"], record["split"])
+        self.assertEqual(current_records["new", 0]["split"], "val")
+        self.assertEqual(current_records["new", 1]["split"], "train")
+        self.assertTrue(all(len(splits) == 1 for splits in splits_by_group.values()))
+        inherited = {current_records[key]["group"] for key in base_records}
+        new_groups = set(splits_by_group) - inherited
+        self.assertEqual(len(new_groups), 48)
+        self.assertEqual(sum(splits_by_group[g] == {"val"} for g in new_groups), round(.1 * len(new_groups)))
+        self.output = self.root / "repeat"
+        self.prepare(**args)
+        self.assertEqual(self.manifest()["records"], expanded["records"])
+
+    def test_base_manifest_rejects_cross_split_bridge_from_new_row(self):
+        result = self.prepare(max_samples=20)
+        train = next(r for r in self.manifest()["records"] if r["split"] == "train")
+        val = next(r for r in self.manifest()["records"] if r["split"] == "val")
+        bridge = dict(self.sources[train["source"]][train["row"]], id=val["source_id"])
+        self.sources["hmer"].append(bridge)
+        self.output = self.root / "expanded"
+        with self.assertRaisesRegex(ValueError, "joins both base train and validation"):
+            self.prepare(max_samples=21, base_manifest=result["manifest_path"])
+        self.assertFalse(self.output.exists())
+
+    def test_base_manifest_rejects_missing_changed_or_unpinned_records(self):
+        result = self.prepare(max_samples=20)
+        self.output = self.root / "expanded"
+        with self.assertRaisesRegex(ValueError, "Base split manifest SHA256 differs"):
+            self.prepare(base_manifest=result["manifest_path"], base_manifest_sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "Base split record missing"):
+            self.prepare(max_samples=19, base_manifest=result["manifest_path"])
+        self.sources["hmer"][0]["image"] = {"bytes": image_bytes(128)}
+        with self.assertRaisesRegex(ValueError, "Base split record changed"):
+            self.prepare(base_manifest=result["manifest_path"])
+        self.assertFalse(self.output.exists())
 
     def test_stream_is_not_consumed_beyond_cap(self):
         def stream():
@@ -209,12 +312,16 @@ class BaselineDataTests(unittest.TestCase):
         builder.config.data_files = {"train": ["fixture.parquet"]}
         with mock.patch("huggingface_hub.HfApi") as api, \
                 mock.patch("datasets.load_dataset_builder", return_value=builder) as load, \
-                mock.patch("scripts.prepare_baseline_data._parquet_rows", side_effect=lambda *a: (r for r in rows())):
+                mock.patch("scripts.prepare_baseline_data._parquet_rows",
+                           side_effect=lambda *a: (row for row in rows())) as read:
             api.return_value.dataset_info.return_value.sha = revision
-            result = prepare_baseline(project, "hmer,count", self.output, dataset_revision=revision)
+            result = prepare_baseline(project, "hmer,count", self.output, dataset_revision=revision,
+                                      max_samples=4, max_samples_by_source={"count": 7})
         api.return_value.dataset_info.assert_called_once_with("fixture/repo", revision=revision)
         self.assertEqual(load.call_count, 2)
         self.assertTrue(all(call.kwargs["revision"] == revision for call in load.call_args_list))
+        self.assertEqual([call.args[-1] for call in read.call_args_list], [4, 7])
+        self.assertEqual(result["counts"]["train_rows"] + result["counts"]["val_rows"], 11)
         self.assertEqual(json.loads(Path(result["manifest_path"]).read_text())["source_revisions"],
                          {"fixture/repo": revision})
 
