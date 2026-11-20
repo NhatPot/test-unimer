@@ -173,6 +173,18 @@ class StopAfterCheckpointCallback(TrainerCallback):
             control.should_training_stop = True
 
 
+class FinalStepMarkerCallback(TrainerCallback):
+    """Tell the launcher that the final step reached evaluation and save."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = Path(marker)
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if state.is_world_process_zero and state.global_step == state.max_steps:
+            self.marker.touch()
+
+
 class PissaConvertCallback(TrainerCallback):
     r"""A callback for converting the PiSSA adapter to a normal one."""
 

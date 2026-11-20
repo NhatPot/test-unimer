@@ -9,10 +9,13 @@ import os
 from pathlib import Path
 import runpy
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
@@ -38,6 +41,7 @@ class FakeClient:
         self.omit = set()
         self.sizes = {}
         self.created = 0
+        self.terminations = []
 
     def log_artifact(self, run_id, local_path, artifact_path=None):
         self.sdk.log_artifact(local_path, artifact_path, run_id)
@@ -77,7 +81,7 @@ class FakeClient:
         pass
 
     def set_terminated(self, run_id, status=None, end_time=None):
-        pass
+        self.terminations.append((run_id, status))
 
     def delete_run(self, run_id):
         pass
@@ -161,6 +165,23 @@ class BaselineLoggingTests(unittest.TestCase):
         self.logger = load_script("dagshub_logger", self.sdk)
         self.wrapper = load_script("train_with_checkpoint_sync", self.sdk)
         mock.patch.object(self.logger, "_command", return_value="test-value").start()
+
+    def test_training_log_upload_redacts_tracking_password(self):
+        log_path = self.root / "train.log"
+        log_path.write_bytes(b"step 1\nAuthorization PRIVATE_TOKEN leaked\n")
+        captured = {}
+
+        class Client:
+            def log_artifact(self, run_id, local_path, artifact_path=None):
+                captured[artifact_path] = Path(local_path).read_bytes()
+
+        failures = []
+        self.wrapper._upload_training_logs(Client(), "run", log_path, None, failures, "test")
+        self.assertEqual(failures, [])
+        self.assertNotIn(b"PRIVATE_TOKEN", captured["logs"])
+        self.assertIn(b"[REDACTED]", captured["logs"])
+        # The on-disk log stays untouched for local diagnosis.
+        self.assertIn(b"PRIVATE_TOKEN", log_path.read_bytes())
 
     def upload(self):
         self.logger.upload_run("baseline", RUN_UUID, self.config, self.output, self.root, self.notebook)
@@ -466,6 +487,7 @@ class BaselineLoggingTests(unittest.TestCase):
         self.assertEqual(args.train_overrides, ["seed=42"])
         self.assertEqual(args.run_uuid, RUN_UUID)
         self.assertEqual(args.post_stop_timeout_seconds, 90 * 60)
+        self.assertEqual(args.post_final_timeout_seconds, 45 * 60)
         self.assertEqual(args.sync_timeout_seconds, 45 * 60)
 
     def test_relative_artifact_paths_resolve_against_project_dir(self):
@@ -479,7 +501,7 @@ class BaselineLoggingTests(unittest.TestCase):
                                output_dir=str(self.output), project_dir=self.root, run_name="baseline",
                                artifact_path="checkpoints", interval_seconds=1, stable_seconds=0,
                                state_path=str(self.root / "state.json"), allow_model_only=False,
-                               post_stop_timeout_seconds=60, sync_timeout_seconds=60,
+                               post_stop_timeout_seconds=60, post_final_timeout_seconds=60, sync_timeout_seconds=60,
                                train_overrides=[])
 
     def run_main(self, returncode=0, final_effect=None, spawn_error=None, watcher_error=False):
@@ -498,7 +520,7 @@ class BaselineLoggingTests(unittest.TestCase):
                     events.append("watcher_start")
                     if watcher_error:
                         self.kwargs["failures"].append({"stage": "background_upload", "error_type": "RuntimeError"})
-                else:
+                elif self.target is not self_outer.wrapper._tee_training_log:
                     self.target(*self.args, **self.kwargs)
 
             def join(self, timeout):
@@ -625,15 +647,148 @@ class BaselineLoggingTests(unittest.TestCase):
 
     def test_post_stop_timeout_terminates_a_real_stalled_cpu_process(self):
         marker = self.root / "stop-step-reached"
+        final_marker = self.root / "final-step-reached"
+        final_step_hang = threading.Event()
         marker.touch()
         with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                               start_new_session=True) as process:
             try:
-                self.assertEqual(self.wrapper._wait_for_training(process, marker, .05, []), 124)
+                self.assertEqual(self.wrapper._wait_for_training(
+                    process, marker, .05, [], final_marker=final_marker, final_step_hang=final_step_hang
+                ), 124)
                 self.assertIsNotNone(process.poll())
+                self.assertFalse(final_step_hang.is_set())
             finally:
                 if process.poll() is None:
                     process.kill()
+
+    def run_fake_launcher(self, source):
+        launcher = self.root / "llamafactory-cli"
+        launcher.write_text(f"#!{sys.executable}\n" + dedent(source), encoding="utf-8")
+        launcher.chmod(0o700)
+        args = self.wrapper_args()
+        args.post_final_timeout_seconds = .25
+        args.interval_seconds = .05
+        with mock.patch.dict(os.environ, {"PATH": str(self.root)}), \
+             mock.patch.object(self.wrapper, "TRAIN_POLL_SECONDS", .02), \
+             mock.patch.object(self.wrapper, "STACK_DUMP_GRACE_SECONDS", .2), \
+             mock.patch.object(self.wrapper, "parse_args", return_value=args), \
+             mock.patch.object(self.wrapper.signal, "signal"), \
+             redirect_stdout(io.StringIO()) as captured, self.assertRaises(SystemExit) as caught:
+            self.wrapper.main()
+        return caught.exception.code, captured.getvalue()
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux rank process discovery")
+    def test_final_step_hang_dumps_two_ranks_and_syncs_checkpoint_and_logs(self):
+        (self.root / "fake_rank.py").write_text(dedent("""
+            import faulthandler
+            import os
+            from pathlib import Path
+            import signal
+            import sys
+            import time
+
+            path = Path(os.environ["TRAIN_STACK_DUMP_DIR"]) / f"rank{sys.argv[1]}"
+            with path.with_suffix(".txt").open("w") as stream:
+                faulthandler.register(signal.SIGUSR1, all_threads=True, file=stream)
+                print(f"stdout from rank {sys.argv[1]}")
+                print(f"stderr from rank {sys.argv[1]}", file=sys.stderr)
+                path.with_suffix(".pid").write_text(str(os.getpid()))
+                time.sleep(4)
+        """), encoding="utf-8")
+        self.checkpoint("checkpoint-138")
+        start = time.monotonic()
+        with mock.patch.object(self.wrapper.os, "kill", wraps=os.kill) as kill, \
+             mock.patch.object(self.wrapper, "_sync_checkpoints_once",
+                               wraps=self.wrapper._sync_checkpoints_once) as sync:
+            code, output = self.run_fake_launcher("""
+                import os
+                from pathlib import Path
+                import subprocess
+                import sys
+                import time
+
+                ranks = [subprocess.Popen([sys.executable, "fake_rank.py", str(rank)], start_new_session=True)
+                         for rank in range(2)]
+                dump_dir = Path(os.environ["TRAIN_STACK_DUMP_DIR"])
+                while len(list(dump_dir.glob("rank*.pid"))) < 2 and all(rank.poll() is None for rank in ranks):
+                    time.sleep(.01)
+                Path(os.environ["TRAIN_FINAL_MARKER"]).touch()
+                for rank in ranks:
+                    rank.wait()
+            """)
+        self.assertEqual(code, 124)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertIn("Trainer did not exit within 0.25s after the final step (exit 124).", output)
+        self.assertEqual(self.sdk.client.terminations, [(RUN_ID, "FAILED")])
+        self.assertEqual(self.sdk.client.tags["train.exit_reason"], "hang_after_final_step")
+        self.assertTrue(any(call.kwargs.get("final") for call in sync.call_args_list))
+        self.assertIn("checkpoints/checkpoint-138/optimizer.pt", self.sdk.client.files)
+
+        log_dir = self.output.parent / "train_logs"
+        log_bytes = (log_dir / f"{RUN_UUID}.log").read_bytes()
+        self.assertEqual(self.sdk.client.files[f"logs/{RUN_UUID}.log"], log_bytes)
+        self.assertEqual(len([path for _, path in self.sdk.uploads if path == "logs"]), 2)
+        for rank in range(2):
+            self.assertIn(f"stdout from rank {rank}", output)
+            self.assertIn(f"stderr from rank {rank}", output)
+            self.assertIn(f"stdout from rank {rank}".encode(), log_bytes)
+            self.assertIn(f"stderr from rank {rank}".encode(), log_bytes)
+            self.assertIn(b"fake_rank.py", self.sdk.client.files[f"logs/stacks/rank{rank}.txt"])
+            pid = int((log_dir / f"{RUN_UUID}-stacks" / f"rank{rank}.pid").read_text())
+            kill.assert_any_call(pid, signal.SIGUSR1)
+        self.assertEqual(kill.call_count, 2)
+
+    def test_exiting_after_final_marker_does_not_kill_or_fail_run(self):
+        with mock.patch.object(self.wrapper, "_terminate_training") as terminate, \
+             mock.patch.object(self.wrapper, "_dump_rank_stacks") as dump:
+            code, output = self.run_fake_launcher("""
+                import os
+                from pathlib import Path
+                import time
+
+                Path(os.environ["TRAIN_FINAL_MARKER"]).touch()
+                time.sleep(.1)
+                print("normal final output")
+            """)
+        self.assertEqual(code, 0)
+        self.assertIn("Final step reached", output)
+        self.assertIn("normal final output", output)
+        self.assertIn(b"normal final output", self.sdk.client.files[f"logs/{RUN_UUID}.log"])
+        terminate.assert_not_called()
+        dump.assert_not_called()
+        self.assertEqual(self.sdk.client.terminations, [])
+        self.assertNotIn("train.exit_reason", self.sdk.client.tags)
+
+    def test_periodic_log_upload_is_rate_limited_and_retries_failures(self):
+        log_path = self.root / "train.log"
+        log_path.write_text("progress")
+        stop = threading.Event()
+        failures = []
+        ticks = iter((0, 0, 599, 600, 601))
+
+        def tick():
+            now = next(ticks)
+            if now == 601:
+                stop.set()
+            return now
+
+        with mock.patch.object(self.wrapper.time, "monotonic", side_effect=tick), \
+             mock.patch.object(self.sdk.client, "log_artifact", side_effect=[RuntimeError(SECRET_ERROR), None]) as call, \
+             redirect_stdout(io.StringIO()) as captured:
+            self.wrapper._watch_checkpoints("baseline", RUN_UUID, self.output, "checkpoints",
+                                            self.root / "state.json", 0, 0, True, stop, failures, log_path)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(failures, [{"stage": "background_logs", "error_type": "RuntimeError"}])
+        self.assertNotIn("PRIVATE_TOKEN", captured.getvalue())
+
+    def test_final_log_upload_failure_does_not_change_successful_exit(self):
+        with mock.patch.object(self.sdk.client, "log_artifact", side_effect=RuntimeError(SECRET_ERROR)):
+            code, _, _, output = self.run_main()
+        self.assertEqual(code, 0)
+        state = json.loads((self.root / "state.json").read_text())
+        self.assertEqual(state["sync_failures"], [{"stage": "final_logs", "error_type": "RuntimeError"}])
+        self.assertIn("Training log upload failed (RuntimeError)", output)
 
     @unittest.skipUnless(sys.platform == "linux", "requires Linux process group discovery")
     def test_timeout_signals_a_rank_in_its_own_process_group(self):

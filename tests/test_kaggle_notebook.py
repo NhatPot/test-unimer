@@ -647,6 +647,16 @@ class KaggleNotebookTests(unittest.TestCase):
         for index in (4, 9, 11):
             self.assertTrue(self.sources[index].startswith("# %%bash"))
 
+    def test_training_cell_propagates_final_watchdog_exit_status(self):
+        fake = self.root / "python"
+        fake.write_text("#!/bin/bash\nexit 124\n")
+        fake.chmod(0o700)
+        result = self.bash(8, RUN_TRAINING="1", PROJECT_DIR=str(self.root),
+                           YAML_CONFIG="runtime.yaml", OUTPUT_DIR=str(self.root / "new"),
+                           PYTHON=str(fake), RUN_UUID="a" * 32, SYNC_STATE_PATH="run/state.json",
+                           MLFLOW_EXPERIMENT_NAME="experiment", EXPERIMENT_VARIANT="K2_onpolicy_sft")
+        self.assertEqual(result.returncode, 124, result.stderr)
+
     def test_upload_propagates_timeout_exit_status(self):
         timeout = self.root / "timeout"
         timeout.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\nexit 124\n')

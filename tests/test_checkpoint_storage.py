@@ -393,6 +393,35 @@ class CheckpointStorageTests(unittest.TestCase):
             self.assertEqual([rank.result(timeout=3) for rank in ranks], [True, True])
         self.assertTrue(marker.is_file())
 
+    def test_final_marker_is_written_only_at_max_steps_on_world_rank_zero(self):
+        from llamafactory.train.callbacks import FinalStepMarkerCallback
+        from transformers import TrainerControl
+
+        marker = self.root / "final-step-reached"
+        callback = FinalStepMarkerCallback(str(marker))
+        control = TrainerControl()
+        for step, rank_zero in ((137, True), (138, False), (139, True), (138, True)):
+            with self.subTest(step=step, rank_zero=rank_zero):
+                state = SimpleNamespace(global_step=step, max_steps=138, is_world_process_zero=rank_zero)
+                callback.on_step_end(None, state, control)
+                self.assertEqual(marker.is_file(), step == 138 and rank_zero)
+                self.assertFalse(control.should_training_stop)
+
+    def test_stack_dump_registration_reports_local_rank_pid_and_open_file(self):
+        import os
+        import signal
+        from llamafactory.train.sft import workflow
+
+        with mock.patch.dict(os.environ, {"LOCAL_RANK": "1"}), \
+             mock.patch.object(workflow, "_stack_dump_file", None), \
+             mock.patch.object(workflow.faulthandler, "register") as register:
+            workflow._register_stack_dump(str(self.root))
+            with workflow._stack_dump_file as stream:
+                register.assert_called_once_with(signal.SIGUSR1, all_threads=True, file=stream)
+                self.assertFalse(stream.closed)
+            self.assertEqual((self.root / "rank1.pid").read_text(), str(os.getpid()))
+            self.assertTrue((self.root / "rank1.txt").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

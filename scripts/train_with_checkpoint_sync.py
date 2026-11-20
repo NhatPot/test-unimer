@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -36,8 +37,11 @@ FULL_CHECKPOINT_FILES = (
 )
 
 POST_STOP_TIMEOUT_SECONDS = 90 * 60
+POST_FINAL_TIMEOUT_SECONDS = 45 * 60
 SYNC_TIMEOUT_SECONDS = 45 * 60
 TRAIN_POLL_SECONDS = 5
+LOG_SYNC_INTERVAL_SECONDS = 10 * 60
+STACK_DUMP_GRACE_SECONDS = 10
 
 
 class SyncTimeout(TimeoutError):
@@ -252,6 +256,31 @@ def _sync_checkpoints_once(
     return uploaded_count
 
 
+def _upload_training_logs(client, run_id, log_path, stack_dump_dir, failures, stage) -> None:
+    try:
+        # The launcher can append during the upload, so publish a fixed-size copy.
+        with tempfile.TemporaryDirectory(prefix="unimer-train-log-") as scratch:
+            snapshot = Path(scratch) / log_path.name
+            data = log_path.read_bytes()
+            # The MLflow repo is publicly readable: never publish the token even if a library echoes it.
+            secret = os.environ.get("MLFLOW_TRACKING_PASSWORD", "").encode()
+            if secret:
+                data = data.replace(secret, b"[REDACTED]")
+            snapshot.write_bytes(data)
+            client.log_artifact(run_id, str(snapshot), artifact_path="logs")
+    except Exception as exc:
+        failures.append({"stage": stage, "error_type": type(exc).__name__})
+        print(f"[checkpoint-sync] Training log upload failed ({type(exc).__name__})", flush=True)
+    if stack_dump_dir is not None:
+        for stack_path in sorted(stack_dump_dir.glob("rank*.txt")):
+            try:
+                if stack_path.stat().st_size:
+                    client.log_artifact(run_id, str(stack_path), artifact_path="logs/stacks")
+            except Exception as exc:
+                failures.append({"stage": stage, "error_type": type(exc).__name__})
+                print(f"[checkpoint-sync] Stack dump upload failed ({type(exc).__name__})", flush=True)
+
+
 def _watch_checkpoints(
     experiment_name: str,
     run_uuid: str,
@@ -263,6 +292,8 @@ def _watch_checkpoints(
     require_full_checkpoint: bool,
     stop_event: threading.Event,
     failures: list[dict[str, str]] | None = None,
+    log_path: Path | None = None,
+    stack_dump_dir: Path | None = None,
 ) -> None:
     failures = failures if failures is not None else []
     try:
@@ -277,6 +308,7 @@ def _watch_checkpoints(
         if not run:
             return
 
+        next_log_upload = time.monotonic()
         while not stop_event.is_set():
             try:
                 count = _sync_checkpoints_once(
@@ -293,6 +325,10 @@ def _watch_checkpoints(
             except Exception as exc:
                 failures.append({"stage": "background_upload", "error_type": type(exc).__name__})
                 print(f"[checkpoint-sync] Background upload failed ({type(exc).__name__}); will retry", flush=True)
+            now = time.monotonic()
+            if log_path is not None and now >= next_log_upload and not stop_event.is_set():
+                next_log_upload = now + LOG_SYNC_INTERVAL_SECONDS
+                _upload_training_logs(client, run.info.run_id, log_path, stack_dump_dir, failures, "background_logs")
             stop_event.wait(interval_seconds)
     except Exception as exc:
         failures.append({"stage": "background_setup", "error_type": type(exc).__name__})
@@ -328,16 +364,43 @@ def _final_sync(
           "not remote-verified. Full output upload/verification remains with dagshub_logger.", flush=True)
 
 
-def _final_sync_with_retries(failures, outcome, **kwargs) -> None:
+def _final_training_diagnostics(experiment_name, run_uuid, log_path, stack_dump_dir, final_step_hang, failures) -> None:
+    try:
+        client, experiment_id = _configure_mlflow(experiment_name)
+        run = _find_run(client, experiment_id, run_uuid)
+        if not run:
+            raise RuntimeError("MLflow run not found for final diagnostics")
+    except Exception as exc:
+        failures.append({"stage": "final_diagnostics_setup", "error_type": type(exc).__name__})
+        print(f"[checkpoint-sync] Final diagnostics setup failed ({type(exc).__name__})", flush=True)
+        return
+
+    run_id = run.info.run_id
+    if final_step_hang:
+        try:
+            try:
+                client.set_tag(run_id, "train.exit_reason", "hang_after_final_step")
+            finally:
+                client.set_terminated(run_id, status="FAILED")
+        except Exception as exc:
+            failures.append({"stage": "final_hang_status", "error_type": type(exc).__name__})
+            print(f"[checkpoint-sync] Failed to record Trainer hang status ({type(exc).__name__})", flush=True)
+    _upload_training_logs(client, run_id, log_path, stack_dump_dir, failures, "final_logs")
+
+
+def _final_sync_with_retries(failures, outcome, *, log_path, stack_dump_dir, final_step_hang, **kwargs) -> None:
     for attempt in range(1, 3):
         outcome["attempts"] = attempt
         try:
             _final_sync(**kwargs)
             outcome["status"] = "submitted"
-            return
+            break
         except Exception as exc:
             failures.append({"stage": "final_sync", "error_type": type(exc).__name__})
             print(f"[checkpoint-sync] Final checkpoint attempt {attempt}/2 failed ({type(exc).__name__})", flush=True)
+    _final_training_diagnostics(
+        kwargs["experiment_name"], kwargs["run_uuid"], log_path, stack_dump_dir, final_step_hang, failures
+    )
 
 
 def _join_sync(thread, deadline: float, stage: str) -> None:
@@ -347,16 +410,65 @@ def _join_sync(thread, deadline: float, stage: str) -> None:
         raise SyncTimeout(f"[checkpoint-sync] Timed out waiting for {stage}; exiting with code 124.")
 
 
-def _terminate_training(process, signum=signal.SIGTERM, grace_seconds=35) -> None:
-    # torchrun's ranks can have process groups of their own outside the launcher's group.
-    groups = {process.pid}
-    pending = [process.pid]
+def _training_pids(launcher_pid: int) -> set[int]:
+    pids = set()
+    pending = [launcher_pid]
     while pending:
         pid = pending.pop()
         try:
-            pending.extend(int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            pending.extend(int(child) for child in children)
+        except FileNotFoundError:
+            pass
+        pids.add(pid)
+    return pids
+
+
+def _dump_rank_stacks(process, stack_dump_dir: Path) -> None:
+    pids = _training_pids(process.pid)
+    ranks = {}
+    for receipt in stack_dump_dir.glob("rank*.pid"):
+        try:
+            pid = int(receipt.read_text(encoding="ascii"))
+            if pid in pids:
+                os.kill(pid, signal.SIGUSR1)
+                ranks[pid] = receipt.stem
+        except (OSError, ValueError):
+            continue
+    if not ranks:
+        print("[train-wrapper] No registered training ranks found for stack dumps.", flush=True)
+        return
+
+    print(f"[train-wrapper] Requested Python stack dumps from {len(ranks)} training rank(s).", flush=True)
+    deadline = time.monotonic() + STACK_DUMP_GRACE_SECONDS
+    py_spy = shutil.which("py-spy")
+    dumps = []
+    if py_spy:
+        for pid, rank in ranks.items():
+            try:
+                with (stack_dump_dir / f"{rank}.py-spy.txt").open("w") as stream:
+                    dumps.append(subprocess.Popen(
+                        [py_spy, "dump", "--pid", str(pid)], stdout=stream, stderr=subprocess.STDOUT
+                    ))
+            except OSError:
+                continue
+    time.sleep(max(0, deadline - time.monotonic()))
+    for dump in dumps:
+        if dump.poll() is None:
+            dump.kill()
+            try:
+                dump.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def _terminate_training(process, signum=signal.SIGTERM, grace_seconds=35) -> None:
+    # torchrun's ranks can have process groups of their own outside the launcher's group.
+    groups = {process.pid}
+    for pid in _training_pids(process.pid):
+        try:
             groups.add(os.getpgid(pid))
-        except (ProcessLookupError, FileNotFoundError):
+        except ProcessLookupError:
             pass
 
     def send_to_groups(sig):
@@ -378,24 +490,62 @@ def _terminate_training(process, signum=signal.SIGTERM, grace_seconds=35) -> Non
         print("[train-wrapper] Launcher still has not exited after SIGKILL.", flush=True)
 
 
-def _wait_for_training(process, stop_marker, timeout_seconds, received_signal) -> int:
+def _wait_for_training(
+    process, stop_marker, timeout_seconds, received_signal, *,
+    final_marker=None, post_final_timeout_seconds=POST_FINAL_TIMEOUT_SECONDS,
+    stack_dump_dir=None, final_step_hang=None,
+) -> int:
     deadline = None
+    final_step = False
     while True:
         if received_signal:
             _terminate_training(process, received_signal[0])
             return 128 + received_signal[0]
-        if deadline is None and stop_marker is not None and stop_marker.is_file():
-            deadline = time.monotonic() + timeout_seconds
-            print(f"[train-wrapper] Stop step reached; giving Trainer {timeout_seconds}s to finish.", flush=True)
+        if deadline is None:
+            if stop_marker is not None and stop_marker.is_file():
+                deadline = time.monotonic() + timeout_seconds
+                print(f"[train-wrapper] Stop step reached; giving Trainer {timeout_seconds}s to finish.", flush=True)
+            elif final_marker is not None and final_marker.is_file():
+                final_step = True
+                deadline = time.monotonic() + post_final_timeout_seconds
+                print(f"[train-wrapper] Final step reached; giving Trainer {post_final_timeout_seconds}s to finish.", flush=True)
         remaining = deadline - time.monotonic() if deadline is not None else TRAIN_POLL_SECONDS
         if remaining <= 0:
-            print("[train-wrapper] Trainer timed out after reaching STOP_AT_GLOBAL_STEP (exit 124).", flush=True)
+            if final_step:
+                if (return_code := process.poll()) is not None:
+                    return return_code
+                if final_step_hang is not None:
+                    final_step_hang.set()
+                if stack_dump_dir is not None:
+                    try:
+                        _dump_rank_stacks(process, stack_dump_dir)
+                    except OSError as exc:
+                        print(f"[train-wrapper] Stack dump failed ({type(exc).__name__}).", flush=True)
+                print(f"[train-wrapper] Trainer did not exit within {post_final_timeout_seconds}s "
+                      "after the final step (exit 124).", flush=True)
+            else:
+                print("[train-wrapper] Trainer timed out after reaching STOP_AT_GLOBAL_STEP (exit 124).", flush=True)
             _terminate_training(process)
             return 124
         try:
             return process.wait(timeout=min(TRAIN_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             continue
+
+
+def _tee_training_log(log_path: Path, training_done: threading.Event) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    with log_path.open("rb") as stream:
+        while True:
+            done = training_done.is_set()
+            chunk = stream.read(64 * 1024)
+            if chunk:
+                print(decoder.decode(chunk), end="", flush=True)
+            elif done:
+                print(decoder.decode(b"", final=True), end="", flush=True)
+                return
+            else:
+                training_done.wait(0.2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -417,11 +567,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-prepared-output", default="")
     parser.add_argument("--post-stop-timeout-seconds", type=int, default=POST_STOP_TIMEOUT_SECONDS,
                         help="Maximum wait for training and final evaluation after reaching the stop step")
+    parser.add_argument("--post-final-timeout-seconds", type=int, default=POST_FINAL_TIMEOUT_SECONDS,
+                        help="Maximum wait for final evaluation, checkpoint and model save, and launcher exit")
     parser.add_argument("--sync-timeout-seconds", type=int, default=SYNC_TIMEOUT_SECONDS,
                         help="Total checkpoint sync shutdown and final-pass budget")
     parser.add_argument("train_overrides", nargs="*")
     args = parser.parse_args()
-    if min(args.post_stop_timeout_seconds, args.sync_timeout_seconds) <= 0:
+    if min(args.post_stop_timeout_seconds, args.post_final_timeout_seconds, args.sync_timeout_seconds) <= 0:
         parser.error("timeout values must be positive")
     return args
 
@@ -452,8 +604,14 @@ def main() -> None:
     elif getattr(args, "resume_best_checkpoint", ""):
         _seed_resume_best(Path(args.resume_best_checkpoint).resolve(), output_dir)
     stop_event = threading.Event()
+    training_done = threading.Event()
+    final_step_hang = threading.Event()
     failures: list[dict[str, str]] = []
     received_signal = []
+    log_dir = output_dir.parent / "train_logs"
+    log_path = log_dir / f"{args.run_uuid}.log"
+    stack_dump_dir = log_dir / f"{args.run_uuid}-stacks"
+    stack_dump_dir.mkdir(parents=True, exist_ok=True)
 
     def stop_handler(signum, _frame):
         stop_event.set()
@@ -475,7 +633,14 @@ def main() -> None:
             "stable_seconds": args.stable_seconds,
             "stop_event": stop_event,
             "failures": failures,
+            "log_path": log_path,
+            "stack_dump_dir": stack_dump_dir,
         },
+        daemon=True,
+    )
+    tee = threading.Thread(
+        target=_tee_training_log,
+        kwargs={"log_path": log_path, "training_done": training_done},
         daemon=True,
     )
     run_name = args.run_name if args.run_uuid in args.run_name else f"{args.run_name}-{args.run_uuid}"
@@ -490,10 +655,13 @@ def main() -> None:
     print(f"[train-wrapper] YAML_CONFIG: {args.yaml_config}", flush=True)
     print(f"[train-wrapper] OUTPUT_DIR: {output_dir}", flush=True)
     print(f"[train-wrapper] Checkpoint sync interval: {args.interval_seconds}s", flush=True)
+    print(f"[train-wrapper] Training log: {log_path}", flush=True)
     # Never echo arbitrary overrides or SDK exceptions: either may contain credentials.
     child_env = os.environ.copy()
     child_env.pop("CHECKPOINT_STORAGE_PLAN", None)
     child_env.pop("TRAIN_STOP_MARKER", None)
+    child_env["TRAIN_STACK_DUMP_DIR"] = str(stack_dump_dir)
+    child_env["PYTHONUNBUFFERED"] = "1"
     if storage_plan:
         child_env["CHECKPOINT_STORAGE_PLAN"] = storage_plan
     tags = json.loads(child_env.get("MLFLOW_TAGS", "{}"))
@@ -509,14 +677,26 @@ def main() -> None:
 
     process = None
     with tempfile.TemporaryDirectory(prefix="unimer-train-") as scratch:
+        final_marker = Path(scratch) / "final-step-reached"
+        child_env["TRAIN_FINAL_MARKER"] = str(final_marker)
         stop_marker = None
         if child_env.get("STOP_AT_GLOBAL_STEP"):
             stop_marker = Path(scratch) / "stop-step-reached"
             child_env["TRAIN_STOP_MARKER"] = str(stop_marker)
         try:
-            process = subprocess.Popen(train_command, cwd=project_dir, env=child_env, start_new_session=True)
+            # Keep the child writing directly to disk if the notebook buffers or stalls stdout.
+            with log_path.open("ab") as log_stream:
+                process = subprocess.Popen(
+                    train_command, cwd=project_dir, env=child_env, start_new_session=True,
+                    stdout=log_stream, stderr=subprocess.STDOUT,
+                )
+            tee.start()
             watcher.start()
-            return_code = _wait_for_training(process, stop_marker, args.post_stop_timeout_seconds, received_signal)
+            return_code = _wait_for_training(
+                process, stop_marker, args.post_stop_timeout_seconds, received_signal,
+                final_marker=final_marker, post_final_timeout_seconds=args.post_final_timeout_seconds,
+                stack_dump_dir=stack_dump_dir, final_step_hang=final_step_hang,
+            )
         except OSError as exc:
             print(f"[train-wrapper] Could not start/wait for training ({type(exc).__name__})", flush=True)
             return_code = 127
@@ -524,9 +704,11 @@ def main() -> None:
                 _terminate_training(process)
         finally:
             stop_event.set()
+            training_done.set()
 
     outcome = {"status": "failed", "verification": "not_verified", "attempts": 0}
     if process is not None:
+        tee.join(5)
         deadline = time.monotonic() + args.sync_timeout_seconds
         _join_sync(watcher, deadline, "background checkpoint sync")
         if time.monotonic() >= deadline:
@@ -534,7 +716,10 @@ def main() -> None:
         final_worker = threading.Thread(
             target=_final_sync_with_retries,
             args=(failures, outcome),
-            kwargs={**sync_args, "stable_seconds": 1},
+            kwargs={
+                **sync_args, "stable_seconds": 1, "log_path": log_path,
+                "stack_dump_dir": stack_dump_dir, "final_step_hang": final_step_hang.is_set(),
+            },
             daemon=True,
         )
         final_worker.start()

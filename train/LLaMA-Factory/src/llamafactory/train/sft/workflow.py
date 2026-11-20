@@ -15,6 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import faulthandler
+import os
+import signal
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
@@ -36,6 +40,17 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+_stack_dump_file = None
+
+
+def _register_stack_dump(directory: str) -> None:
+    global _stack_dump_file
+    rank_path = Path(directory) / f"rank{int(os.getenv('LOCAL_RANK', '0'))}"
+    # Keep the descriptor open through Trainer finalization and distributed teardown.
+    _stack_dump_file = rank_path.with_suffix(".txt").open("a")
+    faulthandler.register(signal.SIGUSR1, all_threads=True, file=_stack_dump_file)
+    # Only processes that have registered are safe for the wrapper to signal.
+    rank_path.with_suffix(".pid").write_text(str(os.getpid()), encoding="ascii")
 
 
 def run_sft(
@@ -46,6 +61,9 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    if stack_dump_dir := os.getenv("TRAIN_STACK_DUMP_DIR"):
+        _register_stack_dump(stack_dump_dir)
+
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

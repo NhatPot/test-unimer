@@ -29,7 +29,7 @@ from typing_extensions import override
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
-from ..callbacks import SaveProcessorCallback, StopAfterCheckpointCallback
+from ..callbacks import FinalStepMarkerCallback, SaveProcessorCallback, StopAfterCheckpointCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 from .hard_example_loss import compute_hard_example_weighted_loss, validate_hard_example_loss_config
@@ -104,6 +104,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.add_callback(StopAfterCheckpointCallback(
                 int(stop_step), self.accelerator.wait_for_everyone, os.getenv("TRAIN_STOP_MARKER")
             ))
+        if final_marker := os.getenv("TRAIN_FINAL_MARKER"):
+            self.add_callback(FinalStepMarkerCallback(final_marker))
 
         if finetuning_args.use_badam:
             from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore
