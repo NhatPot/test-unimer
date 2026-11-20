@@ -139,6 +139,7 @@ class KaggleNotebookTests(unittest.TestCase):
         result = self.prepare_fixture_k2(
             namespace["K1_DATASET_DIR"], self.package, namespace["DATASET_DIR"], namespace["K2_VARIANT"],
             expected_k1_sha256=namespace["K1_SPLIT_SHA256"], expected_onpolicy_sha256=self.package_sha,
+            b4_manifest=namespace["BASE_SPLIT_MANIFEST"], expected_b4_sha256=namespace["BASE_SPLIT_SHA256"],
         )
         namespace["RESUME_DATA_SHA256"] = result["manifest_sha256"]
 
@@ -330,11 +331,14 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(tags["variant"], "K2_onpolicy_sft")
         self.assertEqual(tags["init_adapter_run_id"], namespace["INIT_ADAPTER_RUN_ID"])
         self.assertEqual(tags["init_adapter_sha256"], namespace["INIT_ADAPTER_SHA256"])
+        self.assertEqual(tags["init_adapter_run_id"], "3a87e88b70b54e9a86ae794fa0a42341")
+        self.assertEqual(tags["init_adapter_sha256"], "87af613576981366fa25a92e5435e9cfdc54197709816bcdafe237d7f2c98bf9")
         self.assertEqual(tags["split_sha256"], namespace["K1_SPLIT_SHA256"])
         self.assertEqual(tags["k2_data_sha256"], hashlib.sha256(Path(env["SPLIT_MANIFEST"]).read_bytes()).hexdigest())
         self.assertEqual(tags["initial_global_step"], "0")
         [command] = self.adapter_downloads
         self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[command.index("--run-id") + 1], tags["init_adapter_run_id"])
         self.assertEqual(command[command.index("--artifact-path") + 1], "training")
         self.assertEqual(command[command.index("--adapter-sha256") + 1], tags["init_adapter_sha256"])
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
@@ -351,6 +355,8 @@ class KaggleNotebookTests(unittest.TestCase):
         first_manifest = json.loads(Path(first["SPLIT_MANIFEST"]).read_text())
         second_manifest = json.loads(Path(second["SPLIT_MANIFEST"]).read_text())
         self.assertEqual(first_manifest["replay_row_ids"], second_manifest["replay_row_ids"])
+        self.assertEqual(first_manifest["b4_split_sha256"], onpolicy["BASE_SPLIT_SHA256"])
+        self.assertEqual(second_manifest["b4_split_sha256"], control["BASE_SPLIT_SHA256"])
         self.assertEqual(first_manifest["files"]["val.json"], second_manifest["files"]["val.json"])
         self.assertEqual(second_manifest["variant"], "K2_control_sft")
         self.assertEqual(json.loads(second["MLFLOW_TAGS"])["variant"], "K2_control_sft")
@@ -382,6 +388,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIn('"--max-samples", "8000"', self.k1_source)
         self.assertIn('{"parquet_hme100k_train": 16000, "parquet_mathwriting_train": 16000}', self.k1_source)
         self.assertEqual(overrides["num_train_epochs"], 1)
+        self.assertEqual(overrides["learning_rate"], 1e-4)
         self.assertEqual(overrides["per_device_train_batch_size"], 4)
         self.assertEqual(overrides["gradient_accumulation_steps"], 32)
         self.assertEqual(overrides["per_device_train_batch_size"] * overrides["gradient_accumulation_steps"] * 2, 256)

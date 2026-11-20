@@ -1,4 +1,4 @@
-"""Build a reproducible K2 ShareGPT dataset from the pinned K1 split."""
+"""Build K2 from prepared K1 rows using the original B4 train/validation split."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import hashlib
 import json
 from pathlib import Path
 import random
-import shutil
 import tempfile
 
 from scripts.checkpoint_contract import read_json_object, require_hex, require_regular_path, sha256_file
@@ -17,6 +16,8 @@ from scripts.prepare_baseline_data import _image, _json
 
 
 K1_SPLIT_SHA256 = "50291282d654b23db88b1bc1373ed0f8cce171081ece7d8b35d08e8d8309ef20"
+B4_SPLIT_MANIFEST = Path(__file__).resolve().parents[1] / "train/split_manifests/baseline_8000.json.gz"
+B4_SPLIT_SHA256 = "a3ffe3480ceaafcaebf96f31102e9f97dadd9effc56ca235dc573cb0ff00a11a"
 RECOGNITION = "parquet_crohme_train"
 ONPOLICY = "k2_onpolicy"
 EDL_SOURCES = {f"{RECOGNITION}_{task}": task for task in ("error_find", "error_fix")}
@@ -30,7 +31,7 @@ def replay_quotas(counts, size):
     """Use the largest remainders, breaking ties by source name."""
     total = sum(counts.values())
     if not 0 < size <= total:
-        raise ValueError(f"Cannot sample {size} replay rows from {total} K1 train rows")
+        raise ValueError(f"Cannot sample {size} replay rows from {total} B4 train rows")
     shares = {source: divmod(size * count, total) for source, count in counts.items()}
     quotas = {source: share[0] for source, share in shares.items()}
     ranked = sorted(counts, key=lambda source: (-shares[source][1], source))
@@ -88,6 +89,54 @@ def _read_k1(directory, expected_sha256):
     if any(positions[split] != len(data) for split, data in rows.items()):
         raise ValueError("K1 split counts do not match the dataset files")
     return schema, by_source, val_records
+
+
+def _filter_b4(manifest_path, expected_sha256, k1_by_source, k1_val):
+    path = require_regular_path(Path(manifest_path))
+    raw = path.read_bytes()
+    if path.suffix == ".gz":
+        raw = gzip.decompress(raw)
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("B4 split manifest SHA256 mismatch")
+    manifest = json.loads(raw)
+    if (manifest.get("schema_version") != 1
+            or manifest.get("grouping") != "source_family_id_or_decoded_rgb_sha256"):
+        raise ValueError("K2 requires the B4 image-grouped split")
+
+    splits = {"train": set(), "val": set()}
+    for record in manifest["records"]:
+        splits[record["split"]].add((record["source"], record["row"]))
+    train_keys, val_keys = splits["train"], splits["val"]
+    if (len(train_keys) + len(val_keys) != len(manifest["records"])
+            or not train_keys.isdisjoint(val_keys)):
+        raise ValueError("B4 split contains duplicate source/row keys")
+    expected_counts = (43_242, 4_758) if expected_sha256 == B4_SPLIT_SHA256 else (len(train_keys), len(val_keys))
+
+    by_source = defaultdict(list)
+    val = []
+    for source, rows in k1_by_source.items():
+        for row in rows:
+            row_id, record, _ = row
+            key = (source, record["row"])
+            if key in val_keys:
+                raise ValueError(f"B4 validation row is in K1 train: {row_id}; K2 validation must have "
+                                 f"{expected_counts[1]:,} B4 rows")
+            if key in train_keys:
+                by_source[source].append(row)
+    for row in k1_val:
+        row_id, record, _ = row
+        key = (record["source"], record["row"])
+        if key in train_keys:
+            raise ValueError(f"B4 train row is in K1 validation: {row_id}")
+        if key in val_keys:
+            val.append(row)
+
+    train_count = sum(map(len, by_source.values()))
+    if train_count != expected_counts[0]:
+        raise ValueError(f"K2 B4 replay pool has {train_count:,} rows; expected {expected_counts[0]:,}")
+    if len(val) != expected_counts[1]:
+        raise ValueError(f"K2 B4 validation has {len(val):,} rows; expected {expected_counts[1]:,}")
+    return by_source, val, train_count
 
 
 def _onpolicy_rows(package, expected_sha256, counts, directory, schema, recognition_rows, val_records):
@@ -161,7 +210,7 @@ def _select_control(by_source, onpolicy, quotas, replay_ids, rng, messages_col):
                 (inside if row[0] in replay_ids else outside).append(row)
         count = quotas[task]
         if len(outside) + len(inside) < count:
-            raise ValueError(f"Not enough distinct-from-on-policy K1 {task} rows for the control")
+            raise ValueError(f"Not enough distinct-from-on-policy B4 {task} rows for the control")
         primary = min(count, len(outside))
         from_replay[task] = count - primary
         selected.extend(rng.sample(outside, primary))
@@ -170,7 +219,8 @@ def _select_control(by_source, onpolicy, quotas, replay_ids, rng, messages_col):
 
 
 def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_sha256,
-                    expected_k1_sha256=K1_SPLIT_SHA256, replay_size=30_000,
+                    expected_k1_sha256=K1_SPLIT_SHA256, b4_manifest=B4_SPLIT_MANIFEST,
+                    expected_b4_sha256=B4_SPLIT_SHA256, replay_size=30_000,
                     edl_counts=EDL_COUNTS, seed=42):
     if variant not in ("onpolicy", "control"):
         raise ValueError("Choose K2 variant onpolicy or control")
@@ -178,11 +228,12 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
     output_dir = require_regular_path(Path(output_dir))
     if output_dir.is_relative_to(k1_dir) or k1_dir.is_relative_to(output_dir):
         raise ValueError("K2 output must be separate from the K1 dataset")
-    schema, by_source, val = _read_k1(k1_dir, expected_k1_sha256)
-    if expected_k1_sha256 == K1_SPLIT_SHA256 and (sum(map(len, by_source.values())), len(val)) != (64_843, 7_157):
+    schema, k1_by_source, k1_val = _read_k1(k1_dir, expected_k1_sha256)
+    if expected_k1_sha256 == K1_SPLIT_SHA256 and (sum(map(len, k1_by_source.values())), len(k1_val)) != (64_843, 7_157):
         raise ValueError("Unexpected K1 train or validation count")
+    by_source, val, pool_size = _filter_b4(b4_manifest, expected_b4_sha256, k1_by_source, k1_val)
     onpolicy = _onpolicy_rows(Path(package), expected_onpolicy_sha256, edl_counts, k1_dir,
-                             schema, by_source[RECOGNITION], val)
+                             schema, k1_by_source[RECOGNITION], k1_val)
     quotas = replay_quotas({source: len(rows) for source, rows in by_source.items()}, replay_size)
     rng = random.Random(seed)
     replay = [row for source in sorted(quotas) for row in rng.sample(by_source[source], quotas[source])]
@@ -203,7 +254,9 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
     counts = {"train": _counts(train), "val": _counts(val), "replay": _counts(replay), "edl": _counts(edl)}
     manifest = {
         "schema_version": 1, "variant": f"K2_{variant}_sft", "seed": seed,
-        "k1_split_sha256": expected_k1_sha256, "onpolicy_package_sha256": expected_onpolicy_sha256,
+        "k1_split_sha256": expected_k1_sha256, "b4_split_sha256": expected_b4_sha256,
+        "onpolicy_package_sha256": expected_onpolicy_sha256,
+        "replay_pool_rows": pool_size, "replay_quotas": quotas,
         "counts": counts, "control_edl_rows_reused_from_replay": from_replay,
         "replay_row_ids": [row[0] for row in replay],
         "edl_row_ids": [row[0] for row in edl],
@@ -214,7 +267,7 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
         staging = Path(temp) / "dataset"
         staging.mkdir()
         _json(staging / "train.json", [row[2] for row in train])
-        shutil.copyfile(k1_dir / "val.json", staging / "val.json")
+        _json(staging / "val.json", [row[2] for row in val])
         _json(staging / "dataset_info.json", registry)
         manifest["files"] = {name: sha256_file(staging / name) for name in DATA_FILES}
         manifest_name = "k2_manifest.json"
@@ -236,6 +289,8 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k1-dir", required=True)
+    parser.add_argument("--b4-manifest", type=Path, default=B4_SPLIT_MANIFEST)
+    parser.add_argument("--b4-manifest-sha256", default=B4_SPLIT_SHA256)
     parser.add_argument("--onpolicy-package", type=Path, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--variant", required=True, choices=("onpolicy", "control"))
@@ -254,7 +309,8 @@ def main(argv=None):
     checksum_path = args.onpolicy_package.with_suffix("").with_suffix(".sha256")
     checksum = require_hex(checksum_path.read_text().strip(), 64, "on-policy package checksum")
     result = prepare_k2_data(args.k1_dir, args.onpolicy_package, args.output_dir, args.variant,
-                             expected_onpolicy_sha256=checksum)
+                             expected_onpolicy_sha256=checksum, b4_manifest=args.b4_manifest,
+                             expected_b4_sha256=args.b4_manifest_sha256)
     if args.resume_checkpoint is not None and result["manifest_sha256"] != args.resume_data_sha256:
         raise ValueError("Rebuilt K2 data SHA256 differs from the resumed run")
     result.update(initial_global_step=state["global_step"], initial_epoch=state["epoch"])

@@ -47,8 +47,18 @@ class K2DataTests(unittest.TestCase):
             f"{k2.RECOGNITION}_error_fix": rows(10),
             "parquet_hme100k_train": rows(6, offset=100),
         }
-        result = prepare_from_rows(self.k1, sources,
-                                   {source: entry(source.removeprefix("parquet_")) for source in sources})
+        base = prepare_from_rows(self.root / "b4", sources,
+                                 {source: entry(source.removeprefix("parquet_")) for source in sources})
+        self.b4 = Path(base["manifest_path"])
+        self.b4_sha = base["manifest_sha256"]
+        self.b4_records = json.loads(self.b4.read_text())["records"]
+        sources["parquet_hme100k_train"] = rows(14, offset=100)
+        sources["parquet_mathwriting_train"] = rows(20, offset=140)
+        sources[f"{k2.RECOGNITION}_error_fix"] = rows(12)
+        result = prepare_from_rows(
+            self.k1, sources, {source: entry(source.removeprefix("parquet_")) for source in sources},
+            base_manifest=self.b4, base_manifest_sha256=self.b4_sha,
+        )
         self.k1_sha = result["manifest_sha256"]
         self.manifest = json.loads(Path(result["manifest_path"]).read_text())
         train = self.recognition("train")
@@ -61,6 +71,7 @@ class K2DataTests(unittest.TestCase):
 
     def prepare(self, variant="onpolicy", **kwargs):
         options = dict(expected_onpolicy_sha256=self.package_sha, expected_k1_sha256=self.k1_sha,
+                       b4_manifest=self.b4, expected_b4_sha256=self.b4_sha,
                        replay_size=18, edl_counts=self.tasks)
         options.update(kwargs)
         return k2.prepare_k2_data(self.k1, self.package, self.root / variant, variant, **options)
@@ -75,6 +86,12 @@ class K2DataTests(unittest.TestCase):
         results = {variant: self.prepare(variant) for variant in ("onpolicy", "control")}
         manifests = {}
         train = {}
+        b4_ids = {split: {f"{r['source']}:{r['row']}" for r in self.b4_records if r["split"] == split}
+                  for split in ("train", "val")}
+        k1_val = [r for r in self.manifest["records"] if r["split"] == "val"]
+        expected_val = [payload for r, payload in zip(k1_val, json.loads((self.k1 / "val.json").read_text()), strict=True)
+                        if f"{r['source']}:{r['row']}" in b4_ids["val"]]
+        self.assertLess(len(expected_val), len(k1_val))
         for variant, result in results.items():
             directory = Path(result["dataset_dir"])
             path = Path(result["manifest_path"])
@@ -83,29 +100,34 @@ class K2DataTests(unittest.TestCase):
             for name, digest in manifest["files"].items():
                 self.assertEqual(sha256_file(directory / name), digest)
             self.assertEqual(sha256_file(path), result["manifest_sha256"])
-            self.assertEqual((directory / "val.json").read_bytes(), (self.k1 / "val.json").read_bytes())
+            self.assertEqual(json.loads((directory / "val.json").read_text()), expected_val)
+            self.assertEqual(set(manifest["val_row_ids"]), b4_ids["val"])
             self.assertEqual(manifest["k1_split_sha256"], self.k1_sha)
+            self.assertEqual(manifest["b4_split_sha256"], self.b4_sha)
             self.assertEqual(manifest["onpolicy_package_sha256"], self.package_sha)
             self.assertEqual(manifest["counts"]["train"]["rows"], 23)
             self.assertEqual(manifest["counts"]["edl"]["by_task"], self.tasks)
-            self.assertEqual(manifest["counts"]["replay"]["by_source"],
-                             k2.replay_quotas(Counter(r["source"] for r in self.manifest["records"]
-                                                      if r["split"] == "train"), 18))
+            quotas = k2.replay_quotas(Counter(r["source"] for r in self.b4_records if r["split"] == "train"), 18)
+            self.assertEqual(manifest["replay_pool_rows"], len(b4_ids["train"]))
+            self.assertEqual(manifest["replay_quotas"], quotas)
+            self.assertEqual(manifest["counts"]["replay"]["by_source"], quotas)
+            self.assertTrue(set(manifest["replay_row_ids"]) <= b4_ids["train"])
             self.assertTrue(all(Path(row["image"][0]).is_file() for row in train[variant]))
             self.assertEqual(len(set(manifest["replay_row_ids"])), 18)
             self.assertEqual(self.prepare(variant), result)
         self.assertEqual(manifests["onpolicy"]["replay_row_ids"], manifests["control"]["replay_row_ids"])
         self.assertEqual(train["onpolicy"][:18], train["control"][:18])
         self.assertTrue(set(manifests["onpolicy"]["edl_row_ids"]).isdisjoint(manifests["control"]["edl_row_ids"]))
+        self.assertTrue(set(manifests["control"]["edl_row_ids"]) <= b4_ids["train"])
         self.assertFalse(any(row in train["control"][18:] for row in train["onpolicy"][18:]))
         self.assertEqual(manifests["control"]["control_edl_rows_reused_from_replay"], dict.fromkeys(self.tasks, 0))
         self.assertNotEqual(results["onpolicy"]["manifest_sha256"], results["control"]["manifest_sha256"])
 
     def test_control_prefers_outside_replay_and_records_fallback(self):
-        result = self.prepare("control", replay_size=self.manifest["counts"]["train_rows"] - 1)
+        result = self.prepare("control", replay_size=sum(r["split"] == "train" for r in self.b4_records) - 1)
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         ids = set(manifest["replay_row_ids"])
-        available = Counter(r["source"] for r in self.manifest["records"]
+        available = Counter(r["source"] for r in self.b4_records
                             if r["split"] == "train" and f"{r['source']}:{r['row']}" not in ids)
         expected = {task: self.tasks[task] - available[source] for source, task in k2.EDL_SOURCES.items()}
         self.assertEqual(manifest["control_edl_rows_reused_from_replay"], expected)
@@ -142,6 +164,8 @@ class K2DataTests(unittest.TestCase):
     def test_pins_and_cache_corruption_fail_without_overwriting(self):
         with self.assertRaisesRegex(ValueError, "K1 split manifest SHA256"):
             self.prepare(expected_k1_sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "B4 split manifest SHA256"):
+            self.prepare(expected_b4_sha256="0" * 64)
         with self.assertRaisesRegex(ValueError, "On-policy package SHA256 mismatch"):
             self.prepare(expected_onpolicy_sha256="0" * 64)
         result = self.prepare()
@@ -150,6 +174,25 @@ class K2DataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Existing K2 dataset differs"):
             self.prepare()
         self.assertEqual(train.read_text(), "[]")
+
+    def test_b4_train_cannot_come_from_k1_validation(self):
+        base = json.loads(self.b4.read_text())
+        row = next(r for r in base["records"] if r["split"] == "val")
+        row["split"] = "train"
+        self.b4.write_text(json.dumps(base))
+        with self.assertRaisesRegex(ValueError, "B4 train row is in K1 validation"):
+            self.prepare(expected_b4_sha256=sha256_file(self.b4))
+
+    def test_reports_missing_b4_train_and_validation_rows(self):
+        for split, message in (("train", "B4 replay pool"), ("val", "B4 validation")):
+            with self.subTest(split=split):
+                base = json.loads(self.b4.read_text())
+                row = next(r for r in base["records"] if r["split"] == split)
+                row["row"] = 1000
+                modified = self.root / f"missing-{split}.json"
+                modified.write_text(json.dumps(base))
+                with self.assertRaisesRegex(ValueError, message + " has [0-9]+ rows; expected [0-9]+"):
+                    self.prepare(b4_manifest=modified, expected_b4_sha256=sha256_file(modified))
 
     def test_cli_requires_the_pinned_k1_split(self):
         args = ["--k1-dir", str(self.k1), "--onpolicy-package", str(self.package),
