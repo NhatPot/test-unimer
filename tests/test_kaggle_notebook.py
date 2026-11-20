@@ -7,6 +7,7 @@ import io
 import json
 import os
 from functools import partial
+from math import ceil
 from pathlib import Path
 import shutil
 import subprocess
@@ -43,11 +44,15 @@ class KaggleNotebookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def namespace(self, variant="onpolicy"):
+    def namespace(self, variant="onpolicy", smoke_steps=None):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             source = self.sources[1].replace('K2_VARIANT = "onpolicy"', f'K2_VARIANT = "{variant}"')
+            source = source.replace("SMOKE_STEPS = None", f"SMOKE_STEPS = {smoke_steps!r}")
             exec(compile(source, "cell-1", "exec"), namespace)
+            namespace["config_env"] = {
+                key: os.environ[key] for key in ("EXPERIMENT_VARIANT", "SMOKE_STEPS", "MLFLOW_TAGS")
+            }
             exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
         return namespace
 
@@ -60,7 +65,7 @@ class KaggleNotebookTests(unittest.TestCase):
         values["model_revision"] = self.namespace()["MODEL_REVISION"]
         return values
 
-    def runtime_namespace(self, variant="onpolicy"):
+    def runtime_namespace(self, variant="onpolicy", *, smoke_steps=None, row_copies=1, replay_size=18):
         project = self.root / "project"
         (project / "scripts").mkdir(parents=True, exist_ok=True)
         (project / "train").mkdir(exist_ok=True)
@@ -68,7 +73,7 @@ class KaggleNotebookTests(unittest.TestCase):
                      "scripts/dagshub_checkpoint.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
-        namespace = self.namespace(variant)
+        namespace = self.namespace(variant, smoke_steps)
         namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable, RUN_TRAINING=True,
                          RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"), RUN_DIR=str(self.root / "run"),
                          OUTPUT_DIR=str(self.root / "output"), K1_DATASET_DIR=str(self.root / "K1_datascale_sft"),
@@ -78,12 +83,12 @@ class KaggleNotebookTests(unittest.TestCase):
                     if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
                     and node.targets[0].id in ("K1_DATASETS", "K1_PER_SOURCE_CAPS")}
         names = settings["K1_DATASETS"].split(", ")
-        source_rows = {name: rows() for name in names if name != "parquet_mathwriting_train"}
+        source_rows = {name: rows() * row_copies for name in names if name != "parquet_mathwriting_train"}
         revisions = {"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]}
         base = prepare_from_rows(self.root / "base", source_rows, {name: registry[name] for name in source_rows},
                                  max_samples=8000, revisions=revisions)
         namespace.update(BASE_SPLIT_MANIFEST=base["manifest_path"], BASE_SPLIT_SHA256=base["manifest_sha256"])
-        source_rows["parquet_hme100k_train"] = rows(25)
+        source_rows["parquet_hme100k_train"] += rows(25)[20:]
         source_rows["parquet_mathwriting_train"] = rows(22, offset=100)
         prepared = Path(namespace["K1_DATASET_DIR"])
         result = prepare_from_rows(
@@ -95,6 +100,7 @@ class KaggleNotebookTests(unittest.TestCase):
         records = json.loads(Path(result["manifest_path"]).read_text())["records"]
         images = [r for r in records if r["source"] == k2.RECOGNITION and r["split"] == "train"]
         self.edl_counts = {"error_find": 3, "error_fix": 2}
+        self.replay_size = replay_size
         self.package = project / "train/k2_data/onpolicy_b4_500.json.gz"
         self.package_sha = write_package(self.package, {
             task: [onpolicy_row(row, task) for row in images[:count]]
@@ -104,7 +110,7 @@ class KaggleNotebookTests(unittest.TestCase):
         return namespace
 
     def prepare_fixture_k2(self, *args, **kwargs):
-        return prepare_k2_data(*args, **kwargs, replay_size=18, edl_counts=self.edl_counts)
+        return prepare_k2_data(*args, **kwargs, replay_size=self.replay_size, edl_counts=self.edl_counts)
 
     def run_runtime(self, namespace, runtime_source=None):
         run = subprocess.run
@@ -129,10 +135,11 @@ class KaggleNotebookTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
             return run(command, **kwargs)
 
-        with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()), \
+        with mock.patch.dict(os.environ, namespace["config_env"]), contextlib.redirect_stdout(io.StringIO()) as output, \
                 mock.patch("subprocess.run", side_effect=run_fixture):
             exec(compile(self.k1_source, "cell-k1", "exec"), namespace)
             exec(compile(runtime_source or self.sources[6], "cell-k2", "exec"), namespace)
+            self.runtime_stdout = output.getvalue()
             return dict(os.environ)
 
     def set_resume_data_sha(self, namespace):
@@ -144,7 +151,7 @@ class KaggleNotebookTests(unittest.TestCase):
         namespace["RESUME_DATA_SHA256"] = result["manifest_sha256"]
 
     def bash(self, index, **environment):
-        env = dict(os.environ, RUN_TRAINING="0", PATH="/nonexistent")
+        env = dict(os.environ, RUN_TRAINING="0", SMOKE_STEPS="", PATH="/nonexistent")
         env.update(environment)
         return subprocess.run(["/bin/bash", "-c", self.sources[index].split("\n", 1)[1]],
                               env=env, text=True, capture_output=True, timeout=5)
@@ -180,7 +187,7 @@ class KaggleNotebookTests(unittest.TestCase):
                     ast.parse(source)
 
     def test_host_kernel_has_no_project_yaml_or_ml_import(self):
-        allowed = {"json", "os", "uuid", "subprocess", "pathlib", "kaggle_secrets"}
+        allowed = {"json", "os", "uuid", "subprocess", "pathlib", "math", "kaggle_secrets"}
         for index in (1, 6):
             for node in ast.walk(ast.parse(self.sources[index])):
                 names = ([a.name for a in node.names] if isinstance(node, ast.Import)
@@ -206,16 +213,31 @@ class KaggleNotebookTests(unittest.TestCase):
             exec(self.sources[1], {})
             self.assertEqual(os.environ["STOP_AT_GLOBAL_STEP"], "")
 
+    def test_smoke_steps_must_be_an_even_integer_at_least_two(self):
+        for steps in (0, 1, -2, 3, 6.0, "6", True):
+            with self.subTest(steps=steps), self.assertRaisesRegex(ValueError, "SMOKE_STEPS"):
+                self.namespace(smoke_steps=steps)
+        self.assertEqual(self.namespace(smoke_steps=2)["RUN_VARIANT"], "K2_onpolicy_sft_smoke")
+
+    def test_smoke_rejects_full_resume_and_early_stop(self):
+        source = self.sources[1].replace("SMOKE_STEPS = None", "SMOKE_STEPS = 6")
+        with self.assertRaisesRegex(ValueError, "STOP_AT_GLOBAL_STEP"):
+            exec(source.replace("STOP_AT_GLOBAL_STEP = None", "STOP_AT_GLOBAL_STEP = 3"), {})
+        namespace = self.namespace(smoke_steps=6)
+        with mock.patch.dict(os.environ), self.assertRaisesRegex(ValueError, "USE_DAGSHUB_RESUME"):
+            exec(self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True"), namespace)
+
     def test_session_rerun_retains_uuid_and_clears_stale_config_secret(self):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             exec(self.sources[1], namespace)
             identity, path = namespace["RUN_UUID"], os.environ["PATH"]
-            os.environ.update(YAML_CONFIG="stale", MLFLOW_TRACKING_PASSWORD="secret")
+            os.environ.update(YAML_CONFIG="stale", MLFLOW_TRACKING_PASSWORD="secret", SMOKE_STEPS="6")
             exec(self.sources[1], namespace)
             self.assertEqual(namespace["RUN_UUID"], identity)
             self.assertEqual(os.environ["PATH"], path)
             self.assertEqual(os.environ["YAML_CONFIG"], "")
+            self.assertEqual(os.environ["SMOKE_STEPS"], "")
             self.assertNotIn("MLFLOW_TRACKING_PASSWORD", os.environ)
             self.assertEqual(os.environ["PYTHONNOUSERSITE"], "1")
 
@@ -370,6 +392,123 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(first_manifest["files"]["val.json"], second_manifest["files"]["val.json"])
         self.assertEqual(second_manifest["variant"], "K2_control_sft")
         self.assertEqual(json.loads(second["MLFLOW_TAGS"])["variant"], "K2_control_sft")
+
+    def test_smoke_default_keeps_pre_smoke_runtime_yaml_bytes(self):
+        # Hashes emitted by the notebook at 0cfc373 with the same fixture paths normalized.
+        expected_hashes = {
+            "onpolicy": "fd9a66aca466c81162feb8d6043ae83709b67b13943c3aa39e31be2ad06f0709",
+            "control": "e483f9a10c522d13d6a79902b23b2f94a8460700ffd9beaadfde1fff221cf053",
+        }
+        for variant, expected in expected_hashes.items():
+            with self.subTest(variant=variant):
+                namespace = self.runtime_namespace(variant)
+                self.assertIsNone(namespace["SMOKE_STEPS"])
+                env = self.run_runtime(namespace)
+                runtime = Path(env["YAML_CONFIG"]).read_bytes().replace(bytes(self.root), b"/fixture")
+                self.assertEqual(hashlib.sha256(runtime).hexdigest(), expected)
+                self.assertNotIn("smoke_steps", json.loads(env["MLFLOW_TAGS"]))
+                self.assertNotIn("Smoke runtime YAML", self.runtime_stdout)
+
+    def test_smoke_six_steps_exhausts_epoch_and_keeps_warm_start(self):
+        fake = self.root / "python"
+        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        fake.chmod(0o700)
+        for variant in ("onpolicy", "control"):
+            with self.subTest(variant=variant):
+                # Expand the fixture so both prefixes are shorter than the original datasets.
+                normal = self.runtime_namespace(variant, row_copies=20, replay_size=1800)
+                normal_env = self.run_runtime(normal)
+                normal_config = yaml.safe_load(Path(normal_env["YAML_CONFIG"]).read_bytes())
+                normal_data = Path(normal_config["dataset_dir"])
+                normal_manifest = json.loads(Path(normal_env["SPLIT_MANIFEST"]).read_bytes())
+                normal_train_bytes = (normal_data / "train.json").read_bytes()
+                normal_train = json.loads(normal_train_bytes)
+                normal_val = json.loads((normal_data / "val.json").read_bytes())
+                self.assertGreater(len(normal_train), 1432)
+                self.assertGreater(len(normal_val), 200)
+                [normal_adapter] = self.adapter_downloads
+
+                smoke = self.runtime_namespace(variant, smoke_steps=6, row_copies=20, replay_size=1800)
+                smoke_env = self.run_runtime(smoke)
+                smoke_path = Path(smoke_env["YAML_CONFIG"])
+                smoke_config = yaml.safe_load(smoke_path.read_bytes())
+                smoke_data = Path(smoke["DATASET_DIR"])
+                self.assertEqual(smoke_config, dict(normal_config, dataset="k2_train_smoke",
+                                                    dataset_dir=str(smoke_data), eval_dataset="k2_val_smoke",
+                                                    save_steps=3, eval_steps=3))
+                self.assertEqual(smoke_config["max_steps"], -1)
+                self.assertEqual(smoke_config["num_train_epochs"], 1)
+                self.assertIn(smoke_path.read_text(), self.runtime_stdout)
+                [smoke_adapter] = self.adapter_downloads
+                self.assertEqual(smoke_adapter, normal_adapter)
+
+                registry = json.loads((smoke_data / "dataset_info.json").read_bytes())
+                train_file = registry[smoke_config["dataset"]]["file_name"]
+                self.assertEqual(train_file, "train_smoke.json")
+                train_bytes = (smoke_data / train_file).read_bytes()
+                train = json.loads(train_bytes)
+                self.assertEqual(len(train), 1432)
+                self.assertEqual(train, normal_train[:1432])
+                self.assertEqual((normal_data / "train.json").read_bytes(), normal_train_bytes)
+                self.assertNotIn("k2_train", registry)
+                batch = smoke_config["per_device_train_batch_size"] * smoke["WORLD_SIZE"]
+                accumulation = smoke_config["gradient_accumulation_steps"]
+                self.assertEqual(len(train) % batch, 0)
+                microbatches = ceil(len(train) / batch)
+                self.assertEqual(microbatches, 179)
+                self.assertEqual(ceil(microbatches / accumulation), 6)
+                self.assertEqual(microbatches % accumulation, 19)
+                eval_file = registry[smoke_config["eval_dataset"]]["file_name"]
+                self.assertEqual(eval_file, "val_smoke.json")
+                self.assertEqual(json.loads((smoke_data / eval_file).read_bytes()), normal_val[:200])
+                manifest = json.loads(Path(smoke_env["SPLIT_MANIFEST"]).read_bytes())
+                self.assertEqual(manifest["variant"], normal_manifest["variant"] + "_smoke")
+                self.assertEqual(manifest["datasets"], {"k2_train_smoke": train_file, "k2_val_smoke": eval_file})
+                self.assertEqual(manifest["replay_row_ids"], normal_manifest["replay_row_ids"][:1432])
+                self.assertEqual(manifest["edl_row_ids"], [])
+                self.assertEqual(manifest["counts"]["train"]["rows"], 1432)
+                self.assertEqual(manifest["files"][train_file], hashlib.sha256(train_bytes).hexdigest())
+                self.assertEqual(manifest["val_row_ids"], normal_manifest["val_row_ids"][:200])
+                self.assertEqual(manifest["counts"]["val"]["rows"], 200)
+                val_sha = hashlib.sha256((smoke_data / eval_file).read_bytes()).hexdigest()
+                self.assertEqual(manifest["files"][eval_file], val_sha)
+                tags = json.loads(smoke_env["MLFLOW_TAGS"])
+                self.assertEqual(tags["variant"], smoke_env["EXPERIMENT_VARIANT"])
+                self.assertEqual(tags["variant"], f"K2_{variant}_sft_smoke")
+                self.assertEqual(tags["smoke_steps"], "6")
+                self.assertEqual(smoke_env["SMOKE_STEPS"], "6")
+
+                result = self.bash(
+                    8, RUN_TRAINING="1", PROJECT_DIR=str(self.root), PYTHON=str(fake),
+                    RUN_UUID=smoke["RUN_UUID"], SYNC_STATE_PATH="run/state.json",
+                    MLFLOW_EXPERIMENT_NAME=smoke["EXPERIMENT_NAME"], EXPERIMENT_VARIANT=smoke_env["EXPERIMENT_VARIANT"],
+                    SMOKE_STEPS=smoke_env["SMOKE_STEPS"], YAML_CONFIG=smoke_env["YAML_CONFIG"],
+                    OUTPUT_DIR=smoke_env["OUTPUT_DIR"],
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = result.stdout.splitlines()
+                self.assertEqual(args[args.index("--post-final-timeout-seconds") + 1], "600")
+                self.assertEqual(args[args.index("--artifact-path") + 1], "checkpoints")
+                self.assertEqual(args[args.index("--run-name") + 1], f"{tags['variant']}-{smoke['RUN_UUID']}")
+
+    def test_smoke_row_count_uses_runtime_batch_and_accumulation(self):
+        smoke = self.runtime_namespace(smoke_steps=4, row_copies=20, replay_size=1800)
+        source = self.sources[6].replace('"per_device_train_batch_size": 4', '"per_device_train_batch_size": 2')
+        source = source.replace('"gradient_accumulation_steps": 32', '"gradient_accumulation_steps": 24')
+        env = self.run_runtime(smoke, runtime_source=source)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_bytes())
+        counts = json.loads(Path(env["SPLIT_MANIFEST"]).read_bytes())["counts"]
+        self.assertEqual(counts["train"]["rows"], 364)  # (3 * 24 + 19) * (2 * 2)
+        self.assertEqual(config["save_steps"], 2)
+        self.assertEqual(config["eval_steps"], 2)
+
+    def test_smoke_rejects_a_train_prefix_longer_than_the_real_data(self):
+        smoke = self.runtime_namespace(smoke_steps=6)
+        with self.assertRaisesRegex(RuntimeError, "scripts.prepare_k2_data"):
+            self.run_runtime(smoke)
+        self.assertFalse(Path(smoke["DATASET_DIR"]).exists())
+        self.assertFalse(Path(smoke["RUNTIME_YAML_CONFIG"]).exists())
+        self.assertEqual(self.adapter_downloads, [])
 
     def test_run_training_false_builds_k2_without_downloading_adapter_or_publishing_yaml(self):
         namespace = self.runtime_namespace()
@@ -638,6 +777,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(args[0], "scripts/train_with_checkpoint_sync.py")
         self.assertEqual(args[args.index("--run-name") + 1], "K1_datascale_sft-" + "a" * 32)
         self.assertEqual(args[args.index("--state-path") + 1], "run/state.json")
+        self.assertNotIn("--post-final-timeout-seconds", args)
 
     def test_no_shared_benchmark_upload_or_new_pipeline_claim(self):
         self.assertNotIn("mlflow.start_run", self.sources[10])
@@ -670,7 +810,7 @@ class KaggleNotebookTests(unittest.TestCase):
 
     def test_notebook_source_is_shorter_and_setup_readable(self):
         active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source, self.k1_source])
-        self.assertLess(active, 380)
+        self.assertLess(active, 420)  # Includes smoke sizing and the final-step watchdog.
         self.assertLess(len(self.sources[2].splitlines()), 22)
 
     def test_summary_cli_is_opt_in_and_does_not_include_arbitrary_secrets(self):

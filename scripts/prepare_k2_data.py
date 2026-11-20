@@ -221,9 +221,11 @@ def _select_control(by_source, onpolicy, quotas, replay_ids, rng, messages_col):
 def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_sha256,
                     expected_k1_sha256=K1_SPLIT_SHA256, b4_manifest=B4_SPLIT_MANIFEST,
                     expected_b4_sha256=B4_SPLIT_SHA256, replay_size=30_000,
-                    edl_counts=EDL_COUNTS, seed=42):
+                    edl_counts=EDL_COUNTS, seed=42, smoke_train_rows=None):
     if variant not in ("onpolicy", "control"):
         raise ValueError("Choose K2 variant onpolicy or control")
+    if smoke_train_rows is not None and (type(smoke_train_rows) is not int or smoke_train_rows < 1):
+        raise ValueError("K2 smoke train row count must be a positive integer")
     k1_dir = require_regular_path(Path(k1_dir))
     output_dir = require_regular_path(Path(output_dir))
     if output_dir.is_relative_to(k1_dir) or k1_dir.is_relative_to(output_dir):
@@ -250,10 +252,30 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
         if not path.is_file() or path.is_symlink():
             raise FileNotFoundError(f"Missing K1 image used by K2: {path}")
 
-    registry = {"k2_train": dict(schema, file_name="train.json"), "k2_val": dict(schema, file_name="val.json")}
+    run_variant = f"K2_{variant}_sft"
+    train_dataset, train_file = "k2_train", "train.json"
+    eval_dataset, eval_file = "k2_val", "val.json"
+    if smoke_train_rows is not None:
+        if len(train) < smoke_train_rows:
+            raise ValueError(f"K2 smoke needs {smoke_train_rows:,} train rows, found {len(train):,}")
+        if len(val) < 200:
+            raise ValueError(f"K2 smoke needs 200 validation rows, found {len(val)}")
+        # The full variant's train.json is written in replay-then-EDL order.
+        train = train[:smoke_train_rows]
+        replay = replay[:smoke_train_rows]
+        edl = edl[:smoke_train_rows - len(replay)]
+        val = val[:200]
+        if variant == "control":
+            replay_ids = {row[0] for row in replay}
+            reused = Counter(TASKS_BY_SOURCE[record["source"]] for row_id, record, _ in edl if row_id in replay_ids)
+            from_replay = {task: reused[task] for task in edl_counts}
+        train_dataset, train_file = "k2_train_smoke", "train_smoke.json"
+        eval_dataset, eval_file = "k2_val_smoke", "val_smoke.json"
+        run_variant += "_smoke"
+    registry = {train_dataset: dict(schema, file_name=train_file), eval_dataset: dict(schema, file_name=eval_file)}
     counts = {"train": _counts(train), "val": _counts(val), "replay": _counts(replay), "edl": _counts(edl)}
     manifest = {
-        "schema_version": 1, "variant": f"K2_{variant}_sft", "seed": seed,
+        "schema_version": 1, "variant": run_variant, "seed": seed,
         "k1_split_sha256": expected_k1_sha256, "b4_split_sha256": expected_b4_sha256,
         "onpolicy_package_sha256": expected_onpolicy_sha256,
         "replay_pool_rows": pool_size, "replay_quotas": quotas,
@@ -266,10 +288,14 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
     with tempfile.TemporaryDirectory(prefix=".k2-", dir=output_dir.parent) as temp:
         staging = Path(temp) / "dataset"
         staging.mkdir()
-        _json(staging / "train.json", [row[2] for row in train])
-        _json(staging / "val.json", [row[2] for row in val])
+        _json(staging / train_file, [row[2] for row in train])
+        _json(staging / eval_file, [row[2] for row in val])
         _json(staging / "dataset_info.json", registry)
-        manifest["files"] = {name: sha256_file(staging / name) for name in DATA_FILES}
+        manifest["files"] = {
+            name: sha256_file(staging / name) for name in (train_file, eval_file, "dataset_info.json")
+        }
+        if smoke_train_rows is not None:
+            manifest["datasets"] = {train_dataset: train_file, eval_dataset: eval_file}
         manifest_name = "k2_manifest.json"
         _json(staging / manifest_name, manifest)
         digest = sha256_file(staging / manifest_name)
@@ -281,7 +307,7 @@ def prepare_k2_data(k1_dir, package, output_dir, variant, *, expected_onpolicy_s
         else:
             staging.rename(output_dir)
     return {
-        "dataset_dir": str(output_dir), "train_dataset": "k2_train", "eval_dataset": "k2_val",
+        "dataset_dir": str(output_dir), "train_dataset": train_dataset, "eval_dataset": eval_dataset,
         "manifest_path": str(output_dir / manifest_name), "manifest_sha256": digest, "counts": counts,
     }
 
@@ -294,10 +320,13 @@ def main(argv=None):
     parser.add_argument("--onpolicy-package", type=Path, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--variant", required=True, choices=("onpolicy", "control"))
+    parser.add_argument("--smoke-train-rows", type=int, help="Write a K2 train prefix and the first 200 validation rows")
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--resume-data-sha256")
     parser.add_argument("--total-epochs", type=int, default=1)
     args = parser.parse_args(argv)
+    if args.smoke_train_rows is not None and args.resume_checkpoint is not None:
+        parser.error("--smoke-train-rows requires a fresh warm start")
     state = {"global_step": 0, "epoch": 0}
     if args.resume_checkpoint is not None:
         from scripts.dagshub_checkpoint import validate_resume_target
@@ -310,7 +339,7 @@ def main(argv=None):
     checksum = require_hex(checksum_path.read_text().strip(), 64, "on-policy package checksum")
     result = prepare_k2_data(args.k1_dir, args.onpolicy_package, args.output_dir, args.variant,
                              expected_onpolicy_sha256=checksum, b4_manifest=args.b4_manifest,
-                             expected_b4_sha256=args.b4_manifest_sha256)
+                             expected_b4_sha256=args.b4_manifest_sha256, smoke_train_rows=args.smoke_train_rows)
     if args.resume_checkpoint is not None and result["manifest_sha256"] != args.resume_data_sha256:
         raise ValueError("Rebuilt K2 data SHA256 differs from the resumed run")
     result.update(initial_global_step=state["global_step"], initial_epoch=state["epoch"])
