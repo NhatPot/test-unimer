@@ -157,6 +157,16 @@ class KaggleNotebookTests(unittest.TestCase):
                 self.assertIsNone(cell["execution_count"])
                 self.assertEqual(cell["outputs"], [])
 
+    def test_cell_sources_are_strings_or_line_lists(self):
+        # Kaggle import treats every list item as a line; a list of single characters breaks every cell.
+        for index, cell in enumerate(self.notebook["cells"]):
+            source = cell["source"]
+            if isinstance(source, str):
+                continue
+            self.assertIsInstance(source, list, index)
+            for line in source[:-1]:
+                self.assertTrue(line.endswith("\n"), (index, line))
+
     def test_python_bash_and_embedded_python_parse(self):
         for index, source in enumerate(self.sources[1:] + [self.resume_source, self.k1_source], 1):
             with self.subTest(index=index):
