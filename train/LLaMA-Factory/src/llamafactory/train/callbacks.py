@@ -129,9 +129,10 @@ class SaveProcessorCallback(TrainerCallback):
 class StopAfterCheckpointCallback(TrainerCallback):
     """End this session at a regular checkpoint without shortening the schedule."""
 
-    def __init__(self, step: int, wait_for_everyone: Callable[[], None]) -> None:
+    def __init__(self, step: int, wait_for_everyone: Callable[[], None], stop_marker: str | None = None) -> None:
         self.step = step
         self.wait_for_everyone = wait_for_everyone
+        self.stop_marker = Path(stop_marker) if stop_marker else None
 
     @override
     def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
@@ -150,9 +151,18 @@ class StopAfterCheckpointCallback(TrainerCallback):
             raise ValueError("STOP_AT_GLOBAL_STEP must be a scheduled eval and full checkpoint save step")
 
     @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if self.stop_marker is not None and state.global_step == self.step and state.is_world_process_zero:
+            # Arm the launcher watchdog before the target step's evaluation and save.
+            self.stop_marker.touch(exist_ok=False)
+            print(f"[train-stop] Reached step {self.step}; starting scheduled evaluation and save.", flush=True)
+
+    @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if state.global_step == self.step:
             # Every rank must finish writing its RNG file before checking the checkpoint.
+            if state.is_world_process_zero:
+                print(f"[train-stop] Saved step {self.step}; waiting for all checkpoint writers.", flush=True)
             self.wait_for_everyone()
             if state.is_world_process_zero:
                 from scripts.dagshub_checkpoint import _validate_checkpoint

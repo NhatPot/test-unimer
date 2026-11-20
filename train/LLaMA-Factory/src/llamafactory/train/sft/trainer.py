@@ -101,7 +101,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.add_callback(make_storage_callback(storage_plan))
 
         if stop_step := os.getenv("STOP_AT_GLOBAL_STEP"):
-            self.add_callback(StopAfterCheckpointCallback(int(stop_step), self.accelerator.wait_for_everyone))
+            self.add_callback(StopAfterCheckpointCallback(
+                int(stop_step), self.accelerator.wait_for_everyone, os.getenv("TRAIN_STOP_MARKER")
+            ))
 
         if finetuning_args.use_badam:
             from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore

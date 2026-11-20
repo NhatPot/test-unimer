@@ -8,10 +8,18 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+if __name__ == "__main__" and not __package__:
+    from checkpoint_contract import sha256_file
+    from dagshub_checkpoint import checkpoint_manifest_artifact
+else:
+    from scripts.checkpoint_contract import sha256_file
+    from scripts.dagshub_checkpoint import checkpoint_manifest_artifact
 
 
 CHECKPOINT_FILE_CANDIDATES = (
@@ -26,6 +34,14 @@ FULL_CHECKPOINT_FILES = (
     "optimizer.pt",
     "scheduler.pt",
 )
+
+POST_STOP_TIMEOUT_SECONDS = 90 * 60
+SYNC_TIMEOUT_SECONDS = 45 * 60
+TRAIN_POLL_SECONDS = 5
+
+
+class SyncTimeout(TimeoutError):
+    pass
 
 
 def _resolve_path(path: str | Path, project_dir: Path) -> Path:
@@ -104,34 +120,34 @@ def _file_snapshot(path: Path) -> dict[str, tuple[int, int]]:
     return snapshot
 
 
-def _checkpoint_ready(
+def _stable_checkpoint_snapshot(
     checkpoint_dir: Path,
     stable_seconds: int,
     require_full_checkpoint: bool,
-) -> tuple[bool, str]:
+) -> tuple[dict[str, tuple[int, int]] | None, str]:
     if not checkpoint_dir.is_dir():
-        return False, "not a directory"
+        return None, "not a directory"
 
     if not (checkpoint_dir / "trainer_state.json").is_file():
-        return False, "missing trainer_state.json"
+        return None, "missing trainer_state.json"
 
     if not any((checkpoint_dir / name).is_file() for name in CHECKPOINT_FILE_CANDIDATES):
-        return False, "missing model/adapter file"
+        return None, "missing model/adapter file"
 
     if require_full_checkpoint:
         missing = [name for name in FULL_CHECKPOINT_FILES if not (checkpoint_dir / name).is_file()]
         if missing:
-            return False, f"missing full-checkpoint files: {', '.join(missing)}"
+            return None, f"missing full-checkpoint files: {', '.join(missing)}"
 
     before = _file_snapshot(checkpoint_dir)
     if not before:
-        return False, "empty checkpoint"
+        return None, "empty checkpoint"
     time.sleep(stable_seconds)
     after = _file_snapshot(checkpoint_dir)
     if before != after:
-        return False, "checkpoint is still being written"
+        return None, "checkpoint is still being written"
 
-    return True, "ready"
+    return after, "ready"
 
 
 def _load_state(path: Path) -> dict[str, Any]:
@@ -149,7 +165,14 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 def _save_state(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _sync_checkpoints_once(
@@ -162,8 +185,6 @@ def _sync_checkpoints_once(
     require_full_checkpoint: bool,
     final: bool = False,
 ) -> int:
-    import mlflow
-
     state = _load_state(state_path)
     identity = {"run_id": run_id, "artifact_path": artifact_path.strip("/"),
                 "output_dir": str(output_dir.resolve())}
@@ -184,31 +205,43 @@ def _sync_checkpoints_once(
         if name in uploaded:
             continue
 
-        ready, reason = _checkpoint_ready(
+        snapshot, reason = _stable_checkpoint_snapshot(
             checkpoint_dir,
             stable_seconds=stable_seconds,
             require_full_checkpoint=require_full_checkpoint,
         )
-        if not ready:
+        if snapshot is None:
             if final:
                 raise RuntimeError(f"Final checkpoint is not ready: {name} ({reason})")
             print(f"[checkpoint-sync] Skip {name}: {reason}", flush=True)
             continue
 
         target = f"{artifact_path}/{name}".strip("/")
+        manifest_artifact = checkpoint_manifest_artifact(target)
+        files = [{"path": f"{name}/{relative}", "size": size,
+                  "sha256": sha256_file(checkpoint_dir / relative)}
+                 for relative, (size, _) in sorted(snapshot.items())]
+        if snapshot != _file_snapshot(checkpoint_dir):
+            raise RuntimeError(f"Checkpoint changed while hashing: {name}")
         print(f"[checkpoint-sync] Uploading {name} -> {target}", flush=True)
-        with mlflow.start_run(run_id=run_id):
-            mlflow.log_artifacts(str(checkpoint_dir), artifact_path=target)
-            mlflow.set_tags(
-                {
-                    "checkpoint.synced.latest": name,
-                    "checkpoint.synced.latest_step": str(_checkpoint_step(checkpoint_dir)),
-                }
-            )
+        # Trainer owns the run lifecycle. The manifest is published only after the files.
+        client.log_artifacts(run_id, str(checkpoint_dir), artifact_path=target)
+        if snapshot != _file_snapshot(checkpoint_dir):
+            raise RuntimeError(f"Checkpoint changed during upload: {name}")
+        with tempfile.TemporaryDirectory() as scratch:
+            manifest_file = Path(scratch) / Path(manifest_artifact).name
+            manifest_file.write_text(json.dumps({
+                "schema_version": 1, "run_id": run_id, "artifact_path": target,
+                "file_count": len(files), "files": files,
+            }, indent=2), encoding="utf-8")
+            client.log_artifact(run_id, str(manifest_file), artifact_path=Path(manifest_artifact).parent.as_posix())
+        client.set_tag(run_id, "checkpoint.synced.latest", name)
+        client.set_tag(run_id, "checkpoint.synced.latest_step", str(_checkpoint_step(checkpoint_dir)))
 
         uploaded[name] = {
             "step": _checkpoint_step(checkpoint_dir),
             "artifact_path": target,
+            "manifest_artifact": manifest_artifact,
             "uploaded_at": int(time.time()),
             "verification": "not_verified",
         }
@@ -295,6 +328,76 @@ def _final_sync(
           "not remote-verified. Full output upload/verification remains with dagshub_logger.", flush=True)
 
 
+def _final_sync_with_retries(failures, outcome, **kwargs) -> None:
+    for attempt in range(1, 3):
+        outcome["attempts"] = attempt
+        try:
+            _final_sync(**kwargs)
+            outcome["status"] = "submitted"
+            return
+        except Exception as exc:
+            failures.append({"stage": "final_sync", "error_type": type(exc).__name__})
+            print(f"[checkpoint-sync] Final checkpoint attempt {attempt}/2 failed ({type(exc).__name__})", flush=True)
+
+
+def _join_sync(thread, deadline: float, stage: str) -> None:
+    thread.join(max(0, deadline - time.monotonic()))
+    if thread.is_alive():
+        # No other thread may start uploading or write the receipt while this writer is blocked.
+        raise SyncTimeout(f"[checkpoint-sync] Timed out waiting for {stage}; exiting with code 124.")
+
+
+def _terminate_training(process, signum=signal.SIGTERM, grace_seconds=35) -> None:
+    # torchrun's ranks can have process groups of their own outside the launcher's group.
+    groups = {process.pid}
+    pending = [process.pid]
+    while pending:
+        pid = pending.pop()
+        try:
+            pending.extend(int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
+            groups.add(os.getpgid(pid))
+        except (ProcessLookupError, FileNotFoundError):
+            pass
+
+    def send_to_groups(sig):
+        for group in groups:
+            try:
+                os.killpg(group, sig)
+            except ProcessLookupError:
+                pass
+
+    send_to_groups(signum)
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+    send_to_groups(signal.SIGKILL)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        print("[train-wrapper] Launcher still has not exited after SIGKILL.", flush=True)
+
+
+def _wait_for_training(process, stop_marker, timeout_seconds, received_signal) -> int:
+    deadline = None
+    while True:
+        if received_signal:
+            _terminate_training(process, received_signal[0])
+            return 128 + received_signal[0]
+        if deadline is None and stop_marker is not None and stop_marker.is_file():
+            deadline = time.monotonic() + timeout_seconds
+            print(f"[train-wrapper] Stop step reached; giving Trainer {timeout_seconds}s to finish.", flush=True)
+        remaining = deadline - time.monotonic() if deadline is not None else TRAIN_POLL_SECONDS
+        if remaining <= 0:
+            print("[train-wrapper] Trainer timed out after reaching STOP_AT_GLOBAL_STEP (exit 124).", flush=True)
+            _terminate_training(process)
+            return 124
+        try:
+            return process.wait(timeout=min(TRAIN_POLL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run LLaMA-Factory training and upload checkpoints to DagsHub periodically."
@@ -312,8 +415,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-model-only", action="store_true")
     parser.add_argument("--resume-best-checkpoint", default="")
     parser.add_argument("--resume-prepared-output", default="")
+    parser.add_argument("--post-stop-timeout-seconds", type=int, default=POST_STOP_TIMEOUT_SECONDS,
+                        help="Maximum wait for training and final evaluation after reaching the stop step")
+    parser.add_argument("--sync-timeout-seconds", type=int, default=SYNC_TIMEOUT_SECONDS,
+                        help="Total checkpoint sync shutdown and final-pass budget")
     parser.add_argument("train_overrides", nargs="*")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if min(args.post_stop_timeout_seconds, args.sync_timeout_seconds) <= 0:
+        parser.error("timeout values must be positive")
+    return args
 
 
 def _seed_resume_best(source: Path, output_dir: Path) -> None:
@@ -321,8 +431,8 @@ def _seed_resume_best(source: Path, output_dir: Path) -> None:
     from scripts.dagshub_checkpoint import _copy_resume_file
     if output_dir.exists():
         raise FileExistsError("Training output already exists; refusing to seed or overwrite it")
-    ready, reason = _checkpoint_ready(source, stable_seconds=0, require_full_checkpoint=True)
-    if not ready:
+    snapshot, reason = _stable_checkpoint_snapshot(source, stable_seconds=0, require_full_checkpoint=True)
+    if snapshot is None:
         raise RuntimeError(f"Resume best checkpoint is incomplete: {reason}")
     shutil.copytree(source, output_dir / source.name, copy_function=_copy_resume_file)
     print(f"[train-wrapper] Preserved parent best checkpoint: {source.name}", flush=True)
@@ -343,32 +453,26 @@ def main() -> None:
         _seed_resume_best(Path(args.resume_best_checkpoint).resolve(), output_dir)
     stop_event = threading.Event()
     failures: list[dict[str, str]] = []
-    process_holder: dict[str, subprocess.Popen[Any] | None] = {"process": None}
+    received_signal = []
 
     def stop_handler(signum, _frame):
-        print(f"[train-wrapper] Received signal {signum}; stopping checkpoint sync.", flush=True)
         stop_event.set()
-        process = process_holder["process"]
-        if process and process.poll() is None:
-            try:
-                process.send_signal(signum)
-            except Exception:
-                process.terminate()
+        received_signal.append(signum)
 
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
 
+    sync_args = {
+        "experiment_name": args.experiment, "run_uuid": args.run_uuid,
+        "output_dir": output_dir, "artifact_path": args.artifact_path,
+        "state_path": state_path, "require_full_checkpoint": not args.allow_model_only,
+    }
     watcher = threading.Thread(
         target=_watch_checkpoints,
         kwargs={
-            "experiment_name": args.experiment,
-            "run_uuid": args.run_uuid,
-            "output_dir": output_dir,
-            "artifact_path": args.artifact_path,
-            "state_path": state_path,
+            **sync_args,
             "interval_seconds": args.interval_seconds,
             "stable_seconds": args.stable_seconds,
-            "require_full_checkpoint": not args.allow_model_only,
             "stop_event": stop_event,
             "failures": failures,
         },
@@ -389,6 +493,7 @@ def main() -> None:
     # Never echo arbitrary overrides or SDK exceptions: either may contain credentials.
     child_env = os.environ.copy()
     child_env.pop("CHECKPOINT_STORAGE_PLAN", None)
+    child_env.pop("TRAIN_STOP_MARKER", None)
     if storage_plan:
         child_env["CHECKPOINT_STORAGE_PLAN"] = storage_plan
     tags = json.loads(child_env.get("MLFLOW_TAGS", "{}"))
@@ -402,48 +507,44 @@ def main() -> None:
     child_env["RUN_UUID"] = args.run_uuid
     child_env["MLFLOW_TAGS"] = json.dumps(tags)
 
-    started = False
-    try:
-        process = subprocess.Popen(train_command, cwd=project_dir, env=child_env)
-        process_holder["process"] = process
-        watcher.start()
-        started = True
-        return_code = process.wait()
-    except OSError as exc:
-        print(f"[train-wrapper] Could not start/wait for training ({type(exc).__name__})", flush=True)
-        return_code = 127
-    finally:
-        stop_event.set()
-        if started:
-            # A timed join permits two MLflow writers and concurrent state-file writes.
-            watcher.join()
+    process = None
+    with tempfile.TemporaryDirectory(prefix="unimer-train-") as scratch:
+        stop_marker = None
+        if child_env.get("STOP_AT_GLOBAL_STEP"):
+            stop_marker = Path(scratch) / "stop-step-reached"
+            child_env["TRAIN_STOP_MARKER"] = str(stop_marker)
+        try:
+            process = subprocess.Popen(train_command, cwd=project_dir, env=child_env, start_new_session=True)
+            watcher.start()
+            return_code = _wait_for_training(process, stop_marker, args.post_stop_timeout_seconds, received_signal)
+        except OSError as exc:
+            print(f"[train-wrapper] Could not start/wait for training ({type(exc).__name__})", flush=True)
+            return_code = 127
+            if process is not None:
+                _terminate_training(process)
+        finally:
+            stop_event.set()
 
-    final_ok = False
-    attempts = 0
-    if process_holder["process"] is not None:
-        for attempts in range(1, 3):
-            try:
-                _final_sync(
-                    experiment_name=args.experiment,
-                    run_uuid=args.run_uuid,
-                    output_dir=output_dir,
-                    artifact_path=args.artifact_path,
-                    state_path=state_path,
-                    stable_seconds=1,
-                    require_full_checkpoint=not args.allow_model_only,
-                )
-                final_ok = True
-                break
-            except Exception as exc:
-                failures.append({"stage": "final_sync", "error_type": type(exc).__name__})
-                print(f"[checkpoint-sync] Final checkpoint attempt {attempts}/2 failed "
-                      f"({type(exc).__name__})", flush=True)
+    outcome = {"status": "failed", "verification": "not_verified", "attempts": 0}
+    if process is not None:
+        deadline = time.monotonic() + args.sync_timeout_seconds
+        _join_sync(watcher, deadline, "background checkpoint sync")
+        if time.monotonic() >= deadline:
+            raise SyncTimeout("[checkpoint-sync] No time left for final checkpoint sync; exiting with code 124.")
+        final_worker = threading.Thread(
+            target=_final_sync_with_retries,
+            args=(failures, outcome),
+            kwargs={**sync_args, "stable_seconds": 1},
+            daemon=True,
+        )
+        final_worker.start()
+        _join_sync(final_worker, deadline, "final checkpoint sync")
 
+    final_ok = outcome["status"] == "submitted"
     try:
         state = _load_state(state_path)
         state["sync_failures"] = failures
-        state["final_sync"] = {"status": "submitted" if final_ok else "failed",
-                               "verification": "not_verified", "attempts": attempts}
+        state["final_sync"] = outcome
         _save_state(state_path, state)
     except Exception as exc:
         print(f"[checkpoint-sync] Could not persist sync outcome ({type(exc).__name__})", flush=True)
@@ -457,6 +558,10 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except SyncTimeout as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        # An SDK executor can otherwise keep the interpreter alive during shutdown.
+        os._exit(124)
     except Exception as exc:
         print(f"Training wrapper failed ({type(exc).__name__}); exception details suppressed.", file=sys.stderr)
         sys.exit(1)

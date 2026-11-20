@@ -1,10 +1,13 @@
 """Resume plumbing only: fake checkpoint bytes, no network/model/training."""
 import hashlib
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -24,12 +27,15 @@ class ResumeDownloadTests(unittest.TestCase):
             (self.remote / name).write_bytes(b"fixture bytes only: " + name.encode())
         (self.remote / "trainer_state.json").write_text(json.dumps({"epoch": 2.0, "global_step": 338}))
         self.manifest = self.remote.parent / "artifact_manifest.json"
+        self.specific = self.remote.parent / "checkpoint_manifests"
+        self.specific.mkdir()
         self.manifest.write_text(json.dumps({"files": [
             {"path": f"checkpoint-338/{p.name}", "size": p.stat().st_size,
              "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
             for p in self.remote.iterdir()
         ]}))
         self.client = mock.Mock()
+        self.client.MlflowClient.return_value.list_artifacts.side_effect = self.list_artifacts
         self.client.artifacts.download_artifacts.side_effect = self.download
         configure = mock.patch.object(downloader, "_configure_mlflow", return_value=self.client)
         configure.start()
@@ -44,11 +50,39 @@ class ResumeDownloadTests(unittest.TestCase):
         if artifact_path.endswith("artifact_manifest.json"):
             target = dest / "artifact_manifest.json"
             shutil.copyfile(self.manifest, target)
+        elif artifact_path.startswith("checkpoint_manifests/"):
+            target = dest / Path(artifact_path).name
+            shutil.copyfile(self.specific / target.name, target)
         else:
             name = Path(artifact_path).name
             target = dest / name
             shutil.copytree(self.remote.parent / name, target)
         return str(target)
+
+    def list_artifacts(self, run_id, path):
+        if path is None:
+            return [SimpleNamespace(path=name, is_dir=True, file_size=None)
+                    for name in ("training", "checkpoints", "checkpoint_manifests")]
+        if path in ("training", "checkpoints"):
+            children = list(self.remote.parent.glob("checkpoint-*"))
+            if path == "training" and self.manifest.exists():
+                children.append(self.manifest)
+        else:
+            local = (self.specific if path == "checkpoint_manifests" else
+                     self.remote.parent / path.split('/', 1)[1])
+            children = list(local.iterdir()) if local.is_dir() else []
+        return [SimpleNamespace(path=f"{path}/{item.name}", is_dir=item.is_dir(),
+                                file_size=None if item.is_dir() else item.stat().st_size)
+                for item in children]
+
+    def write_specific(self, checkpoint, *, training_manifest=None):
+        files = json.loads((training_manifest or self.manifest).read_text())["files"]
+        entries = [entry for entry in files if entry["path"].startswith(f"{checkpoint}/")]
+        manifest = self.specific / f"{checkpoint}.json"
+        manifest.write_text(json.dumps({"schema_version": 1, "run_id": "a" * 32,
+                                        "artifact_path": f"checkpoints/{checkpoint}",
+                                        "file_count": len(entries), "files": entries}))
+        return manifest
 
     def prepare(self, **kwargs):
         options = dict(project_dir=self.root, output_dir="cache", enabled=True,
@@ -64,6 +98,54 @@ class ResumeDownloadTests(unittest.TestCase):
         self.assertEqual(os.environ["RESUME_CHECKPOINT"], str(path))
         self.assertTrue((path / "optimizer.pt").is_file())
         self.assertEqual(self.client.artifacts.download_artifacts.call_count, 2)
+
+    def test_source_tags_refuse_a_different_variant_before_downloading(self):
+        self.client.MlflowClient.return_value.get_run.return_value = SimpleNamespace(
+            data=SimpleNamespace(tags={"variant": "K2_control_sft", "k2_data_sha256": "b" * 64})
+        )
+        with self.assertRaisesRegex(ValueError, "Resume source tag mismatch: variant"):
+            self.prepare(expected_run_tags={"variant": "K2_onpolicy_sft", "k2_data_sha256": "b" * 64})
+        self.client.artifacts.download_artifacts.assert_not_called()
+
+    def test_checkpoint_manifest_wins_and_verifies_latest_and_best_without_final_manifest(self):
+        self.add_best()
+        self.write_specific("checkpoint-338")
+        self.write_specific("checkpoint-300")
+        self.manifest.unlink()
+        self.prepare(artifact_path="checkpoints/checkpoint-338", training_output_dir=self.root / "new-output")
+        paths = [call.kwargs["artifact_path"] for call in self.client.artifacts.download_artifacts.call_args_list]
+        self.assertEqual(paths, ["checkpoints/checkpoint-338", "checkpoint_manifests/checkpoint-338.json",
+                                 "checkpoints/checkpoint-300", "checkpoint_manifests/checkpoint-300.json"])
+
+    def test_bad_checkpoint_manifest_does_not_downgrade_to_legacy_or_sizes(self):
+        manifest = self.write_specific("checkpoint-338")
+        content = json.loads(manifest.read_text())
+        content["files"][0]["sha256"] = "0" * 64
+        manifest.write_text(json.dumps(content))
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            self.prepare(artifact_path="checkpoints/checkpoint-338")
+        self.assertEqual(self.client.artifacts.download_artifacts.call_count, 2)
+        self.assertNotIn("RESUME_CHECKPOINT", os.environ)
+
+    def test_missing_final_manifest_uses_recursive_size_listing_and_warns(self):
+        self.manifest.unlink()
+        (self.remote / "nested").mkdir()
+        (self.remote / "nested/metadata").write_bytes(b"original")
+        (self.remote / "nested/empty-metadata").touch()
+        warning = io.StringIO()
+        with contextlib.redirect_stderr(warning):
+            path = self.prepare(artifact_path="checkpoints/checkpoint-338")
+        self.assertIn("verified file names and sizes only", warning.getvalue())
+        self.assertEqual(self.client.artifacts.download_artifacts.call_count, 1)
+        (path / "nested/metadata").write_bytes(b"truncated")
+        with self.assertRaisesRegex(ValueError, "files or sizes differ"):
+            self.prepare(artifact_path="checkpoints/checkpoint-338")
+
+    def test_listing_error_is_not_treated_as_missing_manifest(self):
+        self.client.MlflowClient.return_value.list_artifacts.side_effect = PermissionError("cannot list")
+        with self.assertRaisesRegex(PermissionError, "cannot list"):
+            self.prepare()
+        self.assertNotIn("RESUME_CHECKPOINT", os.environ)
 
     def test_disabled_resume_has_no_network_or_files(self):
         os.environ["RESUME_CHECKPOINT"] = "stale"
@@ -115,6 +197,7 @@ class ResumeDownloadTests(unittest.TestCase):
         for name in ("rng_state_0.pth", "rng_state_1.pth", "scaler.pt"):
             (self.remote / name).unlink()
         (self.remote / "rng_state.pth").write_bytes(b"single GPU fixture")
+        self.manifest.unlink()
         path = self.prepare(world_size=1, fp16=False, manifest_artifact=None)
         self.assertTrue((path / "rng_state.pth").exists())
 

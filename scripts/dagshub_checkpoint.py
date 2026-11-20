@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
-from pathlib import Path
+import sys
+import tempfile
+from pathlib import Path, PurePosixPath
+
+if not __package__:
+    from checkpoint_contract import (
+        BASE_MODEL, read_json_object, require_hex, require_regular_path, sha256_file, validate_checkpoint,
+    )
+else:
+    from scripts.checkpoint_contract import (
+        BASE_MODEL, read_json_object, require_hex, require_regular_path, sha256_file, validate_checkpoint,
+    )
 
 
 MODEL_FILE_CANDIDATES = (
@@ -21,6 +32,160 @@ FULL_CHECKPOINT_FILES = (
     "optimizer.pt",
     "scheduler.pt",
 )
+
+TRAINING_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+
+
+def _verify_training_adapter(directory, run_id, weights_sha256, base_revision):
+    manifest = read_json_object(directory / "artifact_manifest.json")
+    files = manifest["files"]
+    if manifest["file_count"] != len(files):
+        raise ValueError("Training artifact manifest file count mismatch")
+    entries = [entry for entry in files if entry["path"] in TRAINING_ADAPTER_FILES]
+    if sorted(entry["path"] for entry in entries) != sorted(TRAINING_ADAPTER_FILES):
+        raise ValueError("Training artifact manifest must cover each root adapter file exactly once")
+    adapter_files = {entry["path"]: entry for entry in entries}
+    if adapter_files["adapter_model.safetensors"]["sha256"] != weights_sha256:
+        raise ValueError("Training adapter manifest does not match the pinned weights SHA256")
+    return validate_checkpoint(
+        directory / "adapter",
+        {"files": adapter_files, "base_model": BASE_MODEL, "run_id": run_id,
+         "artifact_path": "training", "global_step": None, "base_revision": base_revision},
+        mode="warm-start", base_revision=base_revision,
+    )["checkpoint"]
+
+
+def prepare_training_adapter(project_dir, output_dir, run_id, weights_sha256, base_revision):
+    """Fetch and hash only the root LoRA weights/config from MLflow training/."""
+    require_hex(run_id, 32, "MLflow run ID")
+    require_hex(weights_sha256, 64, "adapter weights SHA256")
+    require_hex(base_revision, 40, "adapter base revision")
+    destination = require_regular_path(_resolve_path(project_dir, output_dir) / run_id)
+    if destination.exists():
+        return _verify_training_adapter(destination, run_id, weights_sha256, base_revision)
+
+    mlflow = _configure_mlflow()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".adapter-", dir=destination.parent) as temp:
+        staging = Path(temp) / "verified"
+        adapter = staging / "adapter"
+        adapter.mkdir(parents=True)
+        for name in ("artifact_manifest.json", *TRAINING_ADAPTER_FILES):
+            downloaded = Path(mlflow.artifacts.download_artifacts(
+                run_id=run_id, artifact_path=f"training/{name}", dst_path=temp,
+            ))
+            shutil.copyfile(require_regular_path(downloaded), (staging if name == "artifact_manifest.json" else adapter) / name)
+        _verify_training_adapter(staging, run_id, weights_sha256, base_revision)
+        if destination.exists():
+            return _verify_training_adapter(destination, run_id, weights_sha256, base_revision)
+        staging.rename(destination)
+    return str(destination / "adapter")
+
+
+def checkpoint_manifest_artifact(artifact_path: str) -> str:
+    checkpoint = PurePosixPath(artifact_path)
+    parent = checkpoint.parent
+    directory = "checkpoint_manifests" if parent.name in ("", "checkpoints") else f"{parent.name}_manifests"
+    return (parent.parent / directory / f"{checkpoint.name}.json").as_posix()
+
+
+def _manifest_exists(client, run_id: str, artifact_path: str) -> bool:
+    path = PurePosixPath(artifact_path)
+    if path.is_absolute() or '..' in path.parts or not path.name:
+        raise ValueError("Manifest must name a relative artifact file")
+    parent = None
+    for index, _ in enumerate(path.parts, start=1):
+        child = '/'.join(path.parts[:index])
+        match = next((entry for entry in client.list_artifacts(run_id, parent) if entry.path == child), None)
+        if match is None:
+            return False
+        if match.is_dir != (index < len(path.parts)):
+            raise ValueError(f"Unexpected artifact type: {child}")
+        parent = child
+    return True
+
+
+def _checkpoint_entries(client, run_id: str, artifact_path: str) -> dict[str, int]:
+    files = {}
+    pending = [artifact_path]
+    while pending:
+        parent = pending.pop()
+        for entry in client.list_artifacts(run_id, parent):
+            path = PurePosixPath(entry.path)
+            if path.parent.as_posix() != parent or path.name == '..' or path.as_posix() != entry.path:
+                raise ValueError("Invalid path in MLflow artifact listing")
+            if entry.is_dir:
+                pending.append(entry.path)
+            else:
+                if type(entry.file_size) is not int or entry.file_size < 0:
+                    raise ValueError(f"MLflow did not report a valid size for {entry.path}")
+                files[path.relative_to(artifact_path).as_posix()] = entry.file_size
+    return files
+
+
+def _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, legacy_manifest):
+    client = mlflow.MlflowClient()
+    specific_manifest = checkpoint_manifest_artifact(artifact_path)
+    local_files = {}
+    if local_checkpoint.is_symlink():
+        raise ValueError("Downloaded checkpoint must not contain symlinks")
+    for path in local_checkpoint.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("Downloaded checkpoint must not contain symlinks")
+        if path.is_file():
+            local_files[path.relative_to(local_checkpoint).as_posix()] = path
+
+    for manifest_artifact in (specific_manifest, legacy_manifest or "training/artifact_manifest.json"):
+        if not _manifest_exists(client, run_id, manifest_artifact):
+            continue
+        manifest_dir = output_path / "manifest"
+        manifest_dir.mkdir(exist_ok=True)
+        manifest_file = mlflow.artifacts.download_artifacts(
+            run_id=run_id, artifact_path=manifest_artifact, dst_path=str(manifest_dir)
+        )
+        manifest = read_json_object(Path(manifest_file))
+        if manifest_artifact == specific_manifest and (
+            manifest.get("schema_version") != 1 or manifest.get("run_id") != run_id
+            or manifest.get("artifact_path") != artifact_path
+        ):
+            raise ValueError("Checkpoint manifest does not match the requested run and artifact")
+
+        prefix = PurePosixPath(artifact_path).name + "/"
+        entries = {}
+        for entry in manifest["files"]:
+            if not entry["path"].startswith(prefix):
+                if manifest_artifact == specific_manifest:
+                    raise ValueError("Unexpected file in checkpoint manifest")
+                continue
+            relative = entry["path"][len(prefix):]
+            path = PurePosixPath(relative)
+            if path.is_absolute() or not path.name or '..' in path.parts or path.as_posix() != relative:
+                raise ValueError("Invalid checkpoint path in artifact manifest")
+            if relative in entries:
+                raise ValueError(f"Duplicate checkpoint file in artifact manifest: {relative}")
+            entries[relative] = entry
+
+        if not entries:
+            raise ValueError("Checkpoint is absent from the selected run's artifact manifest")
+        if manifest_artifact == specific_manifest and manifest.get("file_count") != len(entries):
+            raise ValueError("Checkpoint manifest file count does not match its entries")
+        for name in sorted(local_files.keys() - entries.keys()):
+            raise ValueError(f"Checkpoint file absent from manifest: {name}")
+        for name, entry in entries.items():
+            path = local_files.get(name)
+            if path is None or path.stat().st_size != entry["size"]:
+                raise ValueError(f"Checkpoint file missing or wrong size: {name}")
+            if sha256_file(path) != entry["sha256"]:
+                raise ValueError(f"Checkpoint SHA256 mismatch: {name}")
+        print(f"Checkpoint bytes match {manifest_artifact} (SHA256).")
+        return
+
+    remote_sizes = _checkpoint_entries(client, run_id, artifact_path)
+    local_sizes = {name: path.stat().st_size for name, path in local_files.items()}
+    if remote_sizes != local_sizes:
+        raise ValueError(f"Checkpoint files or sizes differ from the MLflow listing: {artifact_path}")
+    print(f"WARNING: No SHA256 manifest for {artifact_path}; verified file names and sizes only "
+          "against the MLflow listing (same-size corruption cannot be detected).", file=sys.stderr)
 
 
 def _copy_resume_file(source, target):
@@ -103,6 +268,17 @@ def _validate_checkpoint(checkpoint_dir: Path, require_full_checkpoint: bool,
         raise RuntimeError("Checkpoint contains an empty file; download must be checked")
 
 
+def validate_resume_target(checkpoint, target):
+    _validate_checkpoint(checkpoint, True, world_size=2, fp16=True)
+    state = read_json_object(checkpoint / "trainer_state.json")
+    epoch, step = state.get("epoch"), state.get("global_step")
+    if (type(epoch) not in (int, float) or not math.isfinite(epoch) or epoch < 0
+            or type(step) is not int or step < 1
+            or type(target) not in (int, float) or not math.isfinite(target) or target <= epoch):
+        raise ValueError("Resume needs valid saved step/epoch and a total target greater than saved epoch")
+    return state
+
+
 def prepare_resume_checkpoint(
     project_dir: str | Path,
     output_dir: str | Path,
@@ -116,6 +292,7 @@ def prepare_resume_checkpoint(
     fp16: bool = False,
     manifest_artifact: str | None = None,
     training_output_dir: str | Path | None = None,
+    expected_run_tags: dict[str, str] | None = None,
 ) -> str | None:
     """Download a DagsHub MLflow checkpoint artifact for LLaMA-Factory resume."""
     print(f"DagsHub Resume: {'ON' if enabled else 'OFF'}")
@@ -139,8 +316,16 @@ def prepare_resume_checkpoint(
     # A step number is not unique across runs; never reuse another run's cache.
     if not run_id or len(run_id) != 32 or any(c not in "0123456789abcdefABCDEF" for c in run_id):
         raise ValueError("run_id must be the full 32-character MLflow run ID")
-    if not Path(artifact_path).name.startswith("checkpoint-") or ".." in Path(artifact_path).parts:
+    artifact_path = artifact_path.rstrip("/")
+    source = PurePosixPath(artifact_path)
+    if (not source.name.startswith("checkpoint-") or ".." in source.parts
+            or source.is_absolute() or source.as_posix() != artifact_path):
         raise ValueError("artifact_path must select a checkpoint directory")
+    if expected_run_tags:
+        tags = mlflow.MlflowClient().get_run(run_id).data.tags
+        for name, expected in expected_run_tags.items():
+            if tags.get(name) != expected:
+                raise ValueError(f"Resume source tag mismatch: {name}")
     output_path = _resolve_path(project_dir, output_dir) / run_id
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -184,34 +369,7 @@ def prepare_resume_checkpoint(
 
     _validate_checkpoint(local_checkpoint, require_full_checkpoint=require_full_checkpoint,
                          world_size=world_size, fp16=fp16)
-    if manifest_artifact:
-        manifest_file = mlflow.artifacts.download_artifacts(
-            run_id=run_id, artifact_path=manifest_artifact,
-            dst_path=str(output_path / "manifest"),
-        )
-        manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
-        entries = {item["path"]: item for item in manifest["files"]
-                   if item["path"].startswith(f"{checkpoint_name}/")}
-        if not entries:
-            raise ValueError("Checkpoint is absent from the selected run's artifact manifest")
-        for name, entry in entries.items():
-            relative = Path(name).relative_to(checkpoint_name)
-            if ".." in relative.parts:
-                raise ValueError("Invalid checkpoint path in artifact manifest")
-            path = local_checkpoint / relative
-            if not path.is_file() or path.stat().st_size != entry["size"]:
-                raise ValueError(f"Checkpoint file missing or wrong size: {relative}")
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != entry["sha256"]:
-                raise ValueError(f"Checkpoint SHA256 mismatch: {relative}")
-        # Every state used for resume must be covered, not just the adapter.
-        for path in local_checkpoint.iterdir():
-            if path.is_file() and f"{checkpoint_name}/{path.name}" not in entries:
-                raise ValueError(f"Checkpoint file absent from manifest: {path.name}")
-        print("Checkpoint bytes match the selected run's artifact manifest (SHA256).")
+    _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, manifest_artifact)
     if training_output_dir is not None:
         from scripts.checkpoint_storage import stage_resume
         state = json.loads((local_checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
@@ -317,13 +475,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-model-only", action="store_true")
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--manifest-artifact", help="Optional run artifact manifest for SHA256 verification")
+    parser.add_argument("--manifest-artifact", help="Legacy run manifest path (default: training/artifact_manifest.json)")
     parser.add_argument("--training-output-dir", help="Relocate saved best checkpoint for load_best_model_at_end")
+    parser.add_argument("--expected-run-tags", type=json.loads, help="Required source tags for full resume")
+    parser.add_argument("--adapter-sha256", help="Download only the pinned root adapter from training/")
+    parser.add_argument("--adapter-base-revision", help="Pinned base revision in adapter-only mode")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.adapter_sha256 is not None:
+        if (args.artifact_path != "training" or args.training_output_dir or args.run_uuid
+                or args.expected_run_tags is not None or args.manifest_artifact):
+            raise ValueError("Adapter-only mode requires a run ID and the root training artifact")
+        adapter = prepare_training_adapter(args.project_dir, args.output_dir, args.run_id,
+                                           args.adapter_sha256, args.adapter_base_revision)
+        state_path = Path(args.state_path)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"adapter": adapter, "sha256": args.adapter_sha256}), encoding="utf-8")
+        return
+    if args.adapter_base_revision is not None:
+        raise ValueError("--adapter-base-revision requires --adapter-sha256")
+    if args.expected_run_tags is not None and (
+            not isinstance(args.expected_run_tags, dict)
+            or not all(isinstance(value, str) and value for value in args.expected_run_tags.values())):
+        raise ValueError("Expected run tags must map names to nonempty values")
     checkpoint = prepare_resume_checkpoint(
         project_dir=args.project_dir,
         output_dir=args.output_dir,
@@ -337,6 +514,7 @@ def main() -> None:
         fp16=args.fp16,
         manifest_artifact=args.manifest_artifact,
         training_output_dir=args.training_output_dir,
+        expected_run_tags=args.expected_run_tags,
     )
 
     state_path = Path(args.state_path)

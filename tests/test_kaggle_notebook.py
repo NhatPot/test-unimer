@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+from functools import partial
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,11 +16,14 @@ import unittest
 from unittest import mock
 
 import yaml
+from scripts import prepare_k2_data as k2
 from scripts.prepare_baseline_data import prepare_from_rows
+from scripts.prepare_k2_data import prepare_k2_data
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 from test_prepare_baseline_data import rows
+from test_prepare_k2_data import onpolicy_row, write_package
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "uni-mumer-kaggle-dagshub-banmoi.ipynb"
@@ -31,6 +35,7 @@ class KaggleNotebookTests(unittest.TestCase):
         cls.notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
         cls.sources = ["".join(c["source"]) if isinstance(c["source"], list)
                        else c["source"] for c in cls.notebook["cells"]]
+        cls.k1_source = cls.sources.pop(7)
         cls.resume_source = cls.sources.pop(6)
 
     def setUp(self):
@@ -38,10 +43,11 @@ class KaggleNotebookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def namespace(self):
+    def namespace(self, variant="onpolicy"):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
-            exec(compile(self.sources[1], "cell-1", "exec"), namespace)
+            source = self.sources[1].replace('K2_VARIANT = "onpolicy"', f'K2_VARIANT = "{variant}"')
+            exec(compile(source, "cell-1", "exec"), namespace)
             exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
         return namespace
 
@@ -49,10 +55,12 @@ class KaggleNotebookTests(unittest.TestCase):
         settings = next(node.value for node in ast.parse(self.sources[6]).body
                         if isinstance(node, ast.Assign)
                         and any(isinstance(t, ast.Name) and t.id == "YAML_OVERRIDES" for t in node.targets))
-        return {key.value: ast.literal_eval(value)
-                for key, value in zip(settings.keys, settings.values) if key.value != "output_dir"}
+        values = {key.value: ast.literal_eval(value) for key, value in zip(settings.keys, settings.values)
+                  if key.value not in ("output_dir", "model_revision")}
+        values["model_revision"] = self.namespace()["MODEL_REVISION"]
+        return values
 
-    def runtime_namespace(self):
+    def runtime_namespace(self, variant="onpolicy"):
         project = self.root / "project"
         (project / "scripts").mkdir(parents=True, exist_ok=True)
         (project / "train").mkdir(exist_ok=True)
@@ -60,33 +68,79 @@ class KaggleNotebookTests(unittest.TestCase):
                      "scripts/dagshub_checkpoint.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
-        namespace = self.namespace()
-        namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable,
-                         RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"),
-                         OUTPUT_DIR=str(self.root / "output"), BASELINE_DATA_ROOT=str(self.root / "data"))
+        namespace = self.namespace(variant)
+        namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable, RUN_TRAINING=True,
+                         RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"), RUN_DIR=str(self.root / "run"),
+                         OUTPUT_DIR=str(self.root / "output"), K1_DATASET_DIR=str(self.root / "K1_datascale_sft"),
+                         DATASET_DIR=str(self.root / namespace["RUN_VARIANT"]))
         registry = json.loads((project / "train/dataset_info.json").read_text())
-        settings = self.runtime_overrides()
-        names = settings["dataset"].split(", ")
+        settings = {node.targets[0].id: ast.literal_eval(node.value) for node in ast.parse(self.k1_source).body
+                    if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in ("K1_DATASETS", "K1_PER_SOURCE_CAPS")}
+        names = settings["K1_DATASETS"].split(", ")
         source_rows = {name: rows() for name in names if name != "parquet_mathwriting_train"}
         revisions = {"phxember/Uni-MuMER-Data": namespace["DATASET_REVISION"]}
         base = prepare_from_rows(self.root / "base", source_rows, {name: registry[name] for name in source_rows},
-                                 max_samples=settings["max_samples"], revisions=revisions)
+                                 max_samples=8000, revisions=revisions)
         namespace.update(BASE_SPLIT_MANIFEST=base["manifest_path"], BASE_SPLIT_SHA256=base["manifest_sha256"])
         source_rows["parquet_hme100k_train"] = rows(25)
         source_rows["parquet_mathwriting_train"] = rows(22, offset=100)
-        prepared = Path(namespace["BASELINE_DATA_ROOT"]) / namespace["RUN_VARIANT"]
+        prepared = Path(namespace["K1_DATASET_DIR"])
         result = prepare_from_rows(
             prepared, source_rows, {name: registry[name] for name in names}, revisions=revisions,
-            max_samples=settings["max_samples"], max_samples_by_source=settings["max_samples_by_source"],
+            max_samples=8000, max_samples_by_source=settings["K1_PER_SOURCE_CAPS"],
             base_manifest=base["manifest_path"], base_manifest_sha256=base["manifest_sha256"],
         )
-        namespace["RESUME_SPLIT_SHA256"] = result["manifest_sha256"]
+        namespace["K1_SPLIT_SHA256"] = result["manifest_sha256"]
+        records = json.loads(Path(result["manifest_path"]).read_text())["records"]
+        images = [r for r in records if r["source"] == k2.RECOGNITION and r["split"] == "train"]
+        self.edl_counts = {"error_find": 3, "error_fix": 2}
+        self.package = project / "train/k2_data/onpolicy_b4_500.json.gz"
+        self.package_sha = write_package(self.package, {
+            task: [onpolicy_row(row, task) for row in images[:count]]
+            for task, count in self.edl_counts.items()
+        })
+        self.adapter_downloads = []
         return namespace
 
-    def run_runtime(self, namespace):
-        with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()):
-            exec(compile(self.sources[6], "cell-6", "exec"), namespace)
+    def prepare_fixture_k2(self, *args, **kwargs):
+        return prepare_k2_data(*args, **kwargs, replay_size=18, edl_counts=self.edl_counts)
+
+    def run_runtime(self, namespace, runtime_source=None):
+        run = subprocess.run
+
+        def run_fixture(command, **kwargs):
+            if command[1:3] == ["-m", "scripts.prepare_k2_data"]:
+                argv = command[3:].copy()
+                argv[argv.index("--onpolicy-package") + 1] = str(self.package)
+                prepare = partial(self.prepare_fixture_k2, expected_k1_sha256=namespace["K1_SPLIT_SHA256"])
+                try:
+                    with mock.patch.object(k2, "prepare_k2_data", side_effect=prepare), \
+                            contextlib.redirect_stdout(io.StringIO()) as stdout:
+                        k2.main(argv)
+                    return subprocess.CompletedProcess(command, 0, stdout.getvalue(), "")
+                except (ValueError, RuntimeError) as error:
+                    return subprocess.CompletedProcess(command, 1, "", str(error))
+            if command[1] == "scripts/dagshub_checkpoint.py":
+                self.adapter_downloads.append(command)
+                state = Path(command[command.index("--state-path") + 1])
+                state.parent.mkdir(parents=True, exist_ok=True)
+                state.write_text(json.dumps({"adapter": str(self.root / "adapter")}))
+                return subprocess.CompletedProcess(command, 0)
+            return run(command, **kwargs)
+
+        with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch("subprocess.run", side_effect=run_fixture):
+            exec(compile(self.k1_source, "cell-k1", "exec"), namespace)
+            exec(compile(runtime_source or self.sources[6], "cell-k2", "exec"), namespace)
             return dict(os.environ)
+
+    def set_resume_data_sha(self, namespace):
+        result = self.prepare_fixture_k2(
+            namespace["K1_DATASET_DIR"], self.package, namespace["DATASET_DIR"], namespace["K2_VARIANT"],
+            expected_k1_sha256=namespace["K1_SPLIT_SHA256"], expected_onpolicy_sha256=self.package_sha,
+        )
+        namespace["RESUME_DATA_SHA256"] = result["manifest_sha256"]
 
     def bash(self, index, **environment):
         env = dict(os.environ, RUN_TRAINING="0", PATH="/nonexistent")
@@ -95,7 +149,7 @@ class KaggleNotebookTests(unittest.TestCase):
                               env=env, text=True, capture_output=True, timeout=5)
 
     def test_notebook_structure_and_no_historical_outputs(self):
-        self.assertEqual(len(self.notebook["cells"]), 13)
+        self.assertEqual(len(self.notebook["cells"]), 14)
         self.assertEqual(self.notebook["nbformat"], 4)
         for cell in self.notebook["cells"]:
             if cell["cell_type"] == "code":
@@ -103,7 +157,7 @@ class KaggleNotebookTests(unittest.TestCase):
                 self.assertEqual(cell["outputs"], [])
 
     def test_python_bash_and_embedded_python_parse(self):
-        for index, source in enumerate(self.sources[1:] + [self.resume_source], 1):
+        for index, source in enumerate(self.sources[1:] + [self.resume_source, self.k1_source], 1):
             with self.subTest(index=index):
                 if source.startswith("%%bash\n"):
                     result = subprocess.run(["/bin/bash", "-n"], input=source.split("\n", 1)[1],
@@ -136,12 +190,9 @@ class KaggleNotebookTests(unittest.TestCase):
                          "MINICONDA_INSTALLER_SHA256"):
             self.assertNotIn(obsolete, namespace)
 
-    def test_session_one_exports_stop_step_and_session_two_clears_it(self):
-        with mock.patch.dict(os.environ, STOP_AT_GLOBAL_STEP="stale"), contextlib.redirect_stdout(io.StringIO()):
+    def test_k2_clears_previous_stop_step_at_default(self):
+        with mock.patch.dict(os.environ, STOP_AT_GLOBAL_STEP="250"), contextlib.redirect_stdout(io.StringIO()):
             exec(self.sources[1], {})
-            self.assertEqual(os.environ["STOP_AT_GLOBAL_STEP"], "250")
-            resume_config = self.sources[1].replace("STOP_AT_GLOBAL_STEP = 250", "STOP_AT_GLOBAL_STEP = None")
-            exec(resume_config, {})
             self.assertEqual(os.environ["STOP_AT_GLOBAL_STEP"], "")
 
     def test_session_rerun_retains_uuid_and_clears_stale_config_secret(self):
@@ -217,6 +268,14 @@ class KaggleNotebookTests(unittest.TestCase):
             self.run_runtime(namespace)
         self.assertFalse(Path(namespace["RUNTIME_YAML_CONFIG"]).exists())
 
+    def test_pinned_k1_manifest_mismatch_blocks_k2(self):
+        namespace = self.runtime_namespace()
+        namespace["K1_SPLIT_SHA256"] = "0" * 64
+        with self.assertRaises(RuntimeError):
+            self.run_runtime(namespace)
+        self.assertFalse(Path(namespace["DATASET_DIR"]).exists())
+        self.assertEqual(self.adapter_downloads, [])
+
     def test_project_and_framework_dependencies_resolve_together(self):
         self.assertIn('"$PYTHON" -m pip install -q -r requirements.txt -e train/LLaMA-Factory', self.sources[5])
         self.assertEqual(self.sources[5].count("-m pip install"), 1)
@@ -240,17 +299,17 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertIs(config["fp16"], True)
         self.assertIs(config["bf16"], False)
         self.assertIsNone(config["max_samples"])
-        self.assertEqual(config["num_train_epochs"], 2)
+        self.assertEqual(config["num_train_epochs"], 1)
         self.assertEqual(config["val_size"], 0)
-        self.assertEqual(config["eval_dataset"], "baseline_val")
-        self.assertEqual(config["dataset"], "baseline_train")
+        self.assertEqual(config["eval_dataset"], "k2_val")
+        self.assertEqual(config["dataset"], "k2_train")
         self.assertIsNone(config["resume_from_checkpoint"])
-        self.assertIsNone(config["adapter_name_or_path"])
+        self.assertEqual(config["adapter_name_or_path"], str(self.root / "adapter"))
         self.assertEqual(config["max_steps"], -1)  # Trainer compares this integer with zero.
-        self.assertTrue(config["create_new_adapter"])
+        self.assertFalse(config["create_new_adapter"])
         self.assertTrue(config["load_best_model_at_end"])
-        self.assertEqual(config["eval_steps"], 50)
-        self.assertEqual(config["save_steps"], 50)
+        self.assertEqual(config["eval_steps"], 69)
+        self.assertEqual(config["save_steps"], 69)
         self.assertEqual(config["per_device_train_batch_size"], 4)
         self.assertEqual(config["gradient_accumulation_steps"], 32)
         self.assertEqual(config["per_device_train_batch_size"] * config["gradient_accumulation_steps"] * 2, 256)
@@ -267,16 +326,50 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["hard_example_loss_max_weight"], 1.5)
         self.assertEqual(config["model_revision"], "66285546d2b821cf421d4f5eb2576359d3770cd3")
         self.assertNotIn("max_samples_by_source", config)
-        self.assertEqual(json.loads(env["MLFLOW_TAGS"])["variant"], "K1_datascale_sft")
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["variant"], "K2_onpolicy_sft")
+        self.assertEqual(tags["init_adapter_run_id"], namespace["INIT_ADAPTER_RUN_ID"])
+        self.assertEqual(tags["init_adapter_sha256"], namespace["INIT_ADAPTER_SHA256"])
+        self.assertEqual(tags["split_sha256"], namespace["K1_SPLIT_SHA256"])
+        self.assertEqual(tags["k2_data_sha256"], hashlib.sha256(Path(env["SPLIT_MANIFEST"]).read_bytes()).hexdigest())
+        self.assertEqual(tags["initial_global_step"], "0")
+        [command] = self.adapter_downloads
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[command.index("--artifact-path") + 1], "training")
+        self.assertEqual(command[command.index("--adapter-sha256") + 1], tags["init_adapter_sha256"])
         self.assertEqual(env["OUTPUT_DIR"], namespace["OUTPUT_DIR"])
+
+    def test_control_uses_same_training_config_and_selects_control_manifest(self):
+        onpolicy = self.runtime_namespace()
+        first = self.run_runtime(onpolicy)
+        onpolicy_config = yaml.safe_load(Path(first["YAML_CONFIG"]).read_text())
+        control = self.runtime_namespace("control")
+        second = self.run_runtime(control)
+        control_config = yaml.safe_load(Path(second["YAML_CONFIG"]).read_text())
+        self.assertNotEqual(onpolicy_config.pop("dataset_dir"), control_config.pop("dataset_dir"))
+        self.assertEqual(onpolicy_config, control_config)
+        first_manifest = json.loads(Path(first["SPLIT_MANIFEST"]).read_text())
+        second_manifest = json.loads(Path(second["SPLIT_MANIFEST"]).read_text())
+        self.assertEqual(first_manifest["replay_row_ids"], second_manifest["replay_row_ids"])
+        self.assertEqual(first_manifest["files"]["val.json"], second_manifest["files"]["val.json"])
+        self.assertEqual(second_manifest["variant"], "K2_control_sft")
+        self.assertEqual(json.loads(second["MLFLOW_TAGS"])["variant"], "K2_control_sft")
+
+    def test_run_training_false_builds_k2_without_downloading_adapter_or_publishing_yaml(self):
+        namespace = self.runtime_namespace()
+        namespace["RUN_TRAINING"] = False
+        env = self.run_runtime(namespace)
+        self.assertTrue((Path(namespace["DATASET_DIR"]) / "k2_manifest.json").is_file())
+        self.assertEqual(env["YAML_CONFIG"], "")
+        self.assertEqual(self.adapter_downloads, [])
 
     def test_current_notebook_configuration(self):
         namespace = self.namespace()
         self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
         self.assertEqual(namespace["RESUME_RUN_ID"], "")
         self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], "")
-        self.assertEqual(namespace["RESUME_SPLIT_SHA256"], "")
-        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 2)
+        self.assertEqual(namespace["RESUME_DATA_SHA256"], "")
+        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 1)
         self.assertIn('"training/artifact_manifest.json"', self.resume_source)
 
         overrides = self.runtime_overrides()
@@ -285,11 +378,10 @@ class KaggleNotebookTests(unittest.TestCase):
             "parquet_crohme_train_error_find", "parquet_crohme_train_error_fix",
             "parquet_hme100k_train", "parquet_mathwriting_train",
         ]
-        self.assertEqual(overrides["dataset"].split(", "), sources)
-        self.assertEqual(overrides["max_samples"], 8000)
-        self.assertEqual(overrides["max_samples_by_source"],
-                         {"parquet_hme100k_train": 16000, "parquet_mathwriting_train": 16000})
-        self.assertEqual(overrides["num_train_epochs"], 2)
+        self.assertIn(f'K1_DATASETS = "{", ".join(sources)}"', self.k1_source)
+        self.assertIn('"--max-samples", "8000"', self.k1_source)
+        self.assertIn('{"parquet_hme100k_train": 16000, "parquet_mathwriting_train": 16000}', self.k1_source)
+        self.assertEqual(overrides["num_train_epochs"], 1)
         self.assertEqual(overrides["per_device_train_batch_size"], 4)
         self.assertEqual(overrides["gradient_accumulation_steps"], 32)
         self.assertEqual(overrides["per_device_train_batch_size"] * overrides["gradient_accumulation_steps"] * 2, 256)
@@ -328,7 +420,7 @@ class KaggleNotebookTests(unittest.TestCase):
                     exec(compile(source, "cell-resume", "exec"), namespace)
             run.assert_not_called()
 
-    def test_resume_cell_k1_defaults_to_fresh_without_network(self):
+    def test_resume_cell_defaults_to_fresh_without_network(self):
         with mock.patch("subprocess.run") as run:
             namespace = self.namespace()
         run.assert_not_called()
@@ -343,7 +435,7 @@ class KaggleNotebookTests(unittest.TestCase):
         state.parent.mkdir()
         source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
         for name, value in (("RESUME_RUN_ID", "a" * 32), ("RESUME_ARTIFACT_PATH", "checkpoints/checkpoint-250"),
-                            ("RESUME_SPLIT_SHA256", "b" * 64)):
+                            ("RESUME_DATA_SHA256", "b" * 64)):
             source = source.replace(f'{name} = ""', f'{name} = "{value}"')
 
         def download(command, **kwargs):
@@ -353,6 +445,11 @@ class KaggleNotebookTests(unittest.TestCase):
             self.assertIn("resume-source", command[command.index("--output-dir") + 1])
             self.assertIn("--manifest-artifact", command)
             self.assertEqual(command[command.index("--manifest-artifact") + 1], "training/artifact_manifest.json")
+            tags = json.loads(command[command.index("--expected-run-tags") + 1])
+            self.assertEqual(tags["variant"], "K2_onpolicy_sft")
+            self.assertEqual(tags["k2_data_sha256"], "b" * 64)
+            self.assertEqual(tags["init_adapter_run_id"], namespace["INIT_ADAPTER_RUN_ID"])
+            self.assertEqual(tags["init_adapter_sha256"], namespace["INIT_ADAPTER_SHA256"])
             state.write_text(json.dumps({"checkpoint": "/cache/checkpoint-250",
                                          "prepared_output": "/cache/prepared-output"}))
         with mock.patch("subprocess.run", side_effect=download), mock.patch.dict(os.environ), \
@@ -370,12 +467,13 @@ class KaggleNotebookTests(unittest.TestCase):
         (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 250, "epoch": .984}))
         namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint),
                          RESUME_RUN_ID="a" * 32, RESUME_ARTIFACT_PATH="checkpoints/checkpoint-250")
+        self.set_resume_data_sha(namespace)
         env = self.run_runtime(namespace)
         config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertEqual(config["resume_from_checkpoint"], str(checkpoint))
         self.assertEqual(config["adapter_name_or_path"], str(checkpoint))
         self.assertFalse(config["create_new_adapter"])
-        self.assertEqual(config["num_train_epochs"], 2)
+        self.assertEqual(config["num_train_epochs"], 1)
         self.assertEqual(config["max_steps"], -1)
         self.assertEqual(config["lr_scheduler_type"], "cosine")
         self.assertEqual(config["warmup_ratio"], .1)
@@ -385,12 +483,12 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(tags["parent_run_id"], namespace["RESUME_RUN_ID"])
         self.assertEqual(tags["initial_global_step"], "250")
         self.assertEqual(tags["initial_epoch"], "0.984")
-        self.assertEqual(tags["variant"], "K1_datascale_sft")
-        for target in (.984, .5):
-            namespace["RESUME_TOTAL_EPOCHS"] = target
-            with self.subTest(target=target), self.assertRaises(RuntimeError):
-                self.run_runtime(namespace)
-        namespace.update(RESUME_TOTAL_EPOCHS=2, RESUME_SPLIT_SHA256="0" * 64)
+        self.assertEqual(tags["variant"], "K2_onpolicy_sft")
+        self.assertEqual(self.adapter_downloads, [])
+        namespace["RESUME_TOTAL_EPOCHS"] = 0
+        with self.assertRaises(RuntimeError):
+            self.run_runtime(namespace)
+        namespace.update(RESUME_TOTAL_EPOCHS=1, RESUME_DATA_SHA256="0" * 64)
         with self.assertRaises(RuntimeError):
             self.run_runtime(namespace)
         self.assertEqual(yaml.safe_load(Path(env["YAML_CONFIG"]).read_text()), config)
@@ -418,6 +516,7 @@ class KaggleNotebookTests(unittest.TestCase):
             (checkpoint / name).write_bytes(b"fixture only; never unpickle")
         (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 676, "epoch": 4.0}))
         namespace.update(USE_DAGSHUB_RESUME=True, RESUME_CHECKPOINT=str(checkpoint))
+        self.set_resume_data_sha(namespace)
         env = self.run_runtime(namespace)
         config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertEqual(config["resume_from_checkpoint"], str(checkpoint))
@@ -426,8 +525,8 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(config["num_train_epochs"], 6)
         self.assertEqual(config["max_steps"], -1)
         self.assertEqual(config["lr_scheduler_type"], "cosine")
-        self.assertEqual(config["save_steps"], 50)
-        self.assertEqual(config["eval_steps"], 50)
+        self.assertEqual(config["save_steps"], 69)
+        self.assertEqual(config["eval_steps"], 69)
         self.assertEqual(config["save_total_limit"], 2)
         self.assertTrue(config["load_best_model_at_end"])
         tags = json.loads(env["MLFLOW_TAGS"])
@@ -444,7 +543,7 @@ class KaggleNotebookTests(unittest.TestCase):
         env = self.run_runtime(namespace)
         config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertIsNone(config["resume_from_checkpoint"])
-        self.assertTrue(config["create_new_adapter"])
+        self.assertFalse(config["create_new_adapter"])
 
     def test_epoch_baseline_resets_stale_step_limit_to_integer_default(self):
         namespace = self.runtime_namespace()
@@ -456,7 +555,7 @@ class KaggleNotebookTests(unittest.TestCase):
         actual = yaml.safe_load(Path(env["YAML_CONFIG"]).read_text())
         self.assertIs(type(actual["max_steps"]), int)
         self.assertEqual(actual["max_steps"], -1)
-        self.assertEqual(actual["num_train_epochs"], 2)
+        self.assertEqual(actual["num_train_epochs"], 1)
 
     def test_same_runtime_rerun_is_idempotent(self):
         namespace = self.runtime_namespace()
@@ -471,7 +570,7 @@ class KaggleNotebookTests(unittest.TestCase):
         namespace["PYTHON"] = "/missing/python"
         with mock.patch.dict(os.environ, YAML_CONFIG="old"):
             with self.assertRaises(FileNotFoundError), contextlib.redirect_stdout(io.StringIO()):
-                exec(self.sources[6], namespace)
+                exec(self.k1_source, namespace)
             self.assertEqual(os.environ["YAML_CONFIG"], "")
 
     def test_editing_overrides_before_training_can_regenerate_runtime(self):
@@ -479,8 +578,7 @@ class KaggleNotebookTests(unittest.TestCase):
         self.run_runtime(namespace)
         runtime = Path(namespace["RUNTIME_YAML_CONFIG"])
         source = self.sources[6].replace('"learning_rate": 1.0e-4', '"learning_rate": 2.0e-4')
-        with mock.patch.dict(os.environ, MLFLOW_TAGS="{}"), contextlib.redirect_stdout(io.StringIO()):
-            exec(source, namespace)
+        self.run_runtime(namespace, runtime_source=source)
         self.assertEqual(yaml.safe_load(runtime.read_text())["learning_rate"], 2.0e-4)
 
     def test_runtime_changes_blocked_after_training_output_exists(self):
@@ -527,14 +625,25 @@ class KaggleNotebookTests(unittest.TestCase):
     def test_no_shared_benchmark_upload_or_new_pipeline_claim(self):
         self.assertNotIn("mlflow.start_run", self.sources[10])
         self.assertNotIn("kaggle_test_results", self.sources[10])
-        self.assertIn("Train mới hoặc resume", self.sources[0])
+        self.assertIn("full resume", self.sources[0])
         self.assertIn("wrapper cũ", self.sources[8])
         for index in (4, 9, 11):
             self.assertTrue(self.sources[index].startswith("# %%bash"))
 
+    def test_upload_propagates_timeout_exit_status(self):
+        timeout = self.root / "timeout"
+        timeout.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\nexit 124\n')
+        timeout.chmod(0o700)
+        result = self.bash(10, RUN_TRAINING="1", PROJECT_DIR=str(self.root), PATH=str(self.root),
+                           YAML_CONFIG="runtime.yaml", OUTPUT_DIR="output", PYTHON="/own-env/bin/python",
+                           RUN_UUID="a" * 32, MLFLOW_EXPERIMENT_NAME="test", NOTEBOOK_PATH="source.ipynb")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[:5], ["--kill-after=30s", "30m", "/own-env/bin/python",
+                                                         "scripts/dagshub_logger.py", "upload"])
+
     def test_notebook_source_is_shorter_and_setup_readable(self):
-        active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source])
-        self.assertLess(active, 330)
+        active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source, self.k1_source])
+        self.assertLess(active, 380)
         self.assertLess(len(self.sources[2].splitlines()), 22)
 
     def test_summary_cli_is_opt_in_and_does_not_include_arbitrary_secrets(self):

@@ -365,6 +365,34 @@ class CheckpointStorageTests(unittest.TestCase):
         callback.on_save(args, state, control)
         self.assertTrue(control.should_training_stop)
 
+    def test_stop_marker_and_collective_with_two_mock_ranks(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from llamafactory.train.callbacks import StopAfterCheckpointCallback
+        from transformers import TrainerControl
+
+        checkpoint = self.checkpoint(self.root / "checkpoint-250", step=250)
+        rank_one_rng = checkpoint / "rng_state_1.pth"
+        rank_one_rng.unlink()
+        marker = self.root / "stop-step-reached"
+        barrier = Barrier(2, timeout=2)
+        args = SimpleNamespace(output_dir=str(self.root), world_size=2, fp16=True)
+
+        def rank_callback(rank):
+            state = SimpleNamespace(global_step=250, max_steps=508, is_world_process_zero=rank == 0)
+            control = TrainerControl()
+            callback = StopAfterCheckpointCallback(250, barrier.wait, str(marker))
+            callback.on_step_end(args, state, control)
+            if rank == 1:
+                rank_one_rng.write_bytes(b"rank-1 RNG fixture")
+            callback.on_save(args, state, control)
+            return control.should_training_stop
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ranks = [pool.submit(rank_callback, rank) for rank in range(2)]
+            self.assertEqual([rank.result(timeout=3) for rank in ranks], [True, True])
+        self.assertTrue(marker.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

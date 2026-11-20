@@ -1,12 +1,15 @@
 """CPU-only coverage for the legacy baseline logging/sync entry points."""
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import runpy
+import selectors
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,6 +38,12 @@ class FakeClient:
         self.omit = set()
         self.sizes = {}
         self.created = 0
+
+    def log_artifact(self, run_id, local_path, artifact_path=None):
+        self.sdk.log_artifact(local_path, artifact_path, run_id)
+
+    def log_artifacts(self, run_id, local_dir, artifact_path=None):
+        self.sdk.log_artifacts(local_dir, artifact_path, run_id)
 
     def get_experiment_by_name(self, name):
         return self.experiment
@@ -78,6 +87,7 @@ class FakeMlflow(ModuleType):
     def __init__(self):
         super().__init__("mlflow")
         self.client = FakeClient()
+        self.client.sdk = self
         self.MlflowClient = lambda: self.client
         self.tags = {}
         self.metrics = {}
@@ -366,12 +376,56 @@ class BaselineLoggingTests(unittest.TestCase):
         state = json.loads(state_path.read_text())
         self.assertEqual(state["identity"]["run_id"], RUN_ID)
         self.assertEqual(state["uploaded"]["checkpoint-5"]["verification"], "not_verified")
-        self.assertEqual(len(self.sdk.uploads), 1)
-        self.final()
-        self.assertEqual(len(self.sdk.uploads), 1)
-        self.sdk.client.runs[0].info.run_id = "c" * 32
+        self.assertEqual(len(self.sdk.uploads), 2)
         self.final()
         self.assertEqual(len(self.sdk.uploads), 2)
+        self.sdk.client.runs[0].info.run_id = "c" * 32
+        self.final()
+        self.assertEqual(len(self.sdk.uploads), 4)
+
+    def test_sync_publishes_manifest_after_files_without_changing_run_lifecycle(self):
+        checkpoint = self.checkpoint()
+        (checkpoint / "nested").mkdir()
+        (checkpoint / "nested/metadata").write_bytes(b"metadata")
+        with mock.patch.object(self.sdk, "start_run", side_effect=AssertionError("Trainer owns the run")):
+            self.final()
+        target = "checkpoints/checkpoint-5"
+        manifest_path = "checkpoint_manifests/checkpoint-5.json"
+        self.assertEqual([folder for _, folder in self.sdk.uploads], [target, "checkpoint_manifests"])
+        manifest = json.loads(self.sdk.client.files[manifest_path])
+        self.assertEqual(manifest["artifact_path"], target)
+        self.assertEqual(manifest["run_id"], RUN_ID)
+        self.assertEqual(manifest["file_count"], len(list(checkpoint.rglob("*"))) - 1)
+        for entry in manifest["files"]:
+            payload = self.sdk.client.files["checkpoints/" + entry["path"]]
+            self.assertEqual(entry["size"], len(payload))
+            self.assertEqual(entry["sha256"], hashlib.sha256(payload).hexdigest())
+        state = json.loads((self.root / "state.json").read_text())
+        self.assertEqual(state["uploaded"]["checkpoint-5"]["manifest_artifact"], manifest_path)
+
+    def test_failed_manifest_upload_is_not_acknowledged_and_is_retried(self):
+        self.checkpoint()
+        with mock.patch.object(self.sdk.client, "log_artifact", side_effect=RuntimeError("manifest unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "manifest unavailable"):
+                self.final()
+        self.assertFalse((self.root / "state.json").exists())
+        self.assertNotIn("checkpoint_manifests/checkpoint-5.json", self.sdk.client.files)
+        self.final()
+        self.assertIn("checkpoint_manifests/checkpoint-5.json", self.sdk.client.files)
+
+    def test_checkpoint_mutated_during_upload_is_not_published_with_stale_hashes(self):
+        checkpoint = self.checkpoint()
+        upload = self.sdk.client.log_artifacts
+
+        def changing_upload(*args, **kwargs):
+            upload(*args, **kwargs)
+            (checkpoint / "optimizer.pt").write_bytes(b"rewritten")
+
+        with mock.patch.object(self.sdk.client, "log_artifacts", side_effect=changing_upload):
+            with self.assertRaisesRegex(RuntimeError, "changed during upload"):
+                self.final()
+        self.assertFalse((self.root / "state.json").exists())
+        self.assertNotIn("checkpoint_manifests/checkpoint-5.json", self.sdk.client.files)
 
     def test_background_errors_are_collected_without_credentials(self):
         stop = threading.Event()
@@ -411,6 +465,8 @@ class BaselineLoggingTests(unittest.TestCase):
             args = self.wrapper.parse_args()
         self.assertEqual(args.train_overrides, ["seed=42"])
         self.assertEqual(args.run_uuid, RUN_UUID)
+        self.assertEqual(args.post_stop_timeout_seconds, 90 * 60)
+        self.assertEqual(args.sync_timeout_seconds, 45 * 60)
 
     def test_relative_artifact_paths_resolve_against_project_dir(self):
         self.logger.upload_run("baseline", RUN_UUID, Path("runtime.yaml"), Path("output"),
@@ -423,6 +479,7 @@ class BaselineLoggingTests(unittest.TestCase):
                                output_dir=str(self.output), project_dir=self.root, run_name="baseline",
                                artifact_path="checkpoints", interval_seconds=1, stable_seconds=0,
                                state_path=str(self.root / "state.json"), allow_model_only=False,
+                               post_stop_timeout_seconds=60, sync_timeout_seconds=60,
                                train_overrides=[])
 
     def run_main(self, returncode=0, final_effect=None, spawn_error=None, watcher_error=False):
@@ -432,17 +489,25 @@ class BaselineLoggingTests(unittest.TestCase):
         process.wait.return_value = returncode
 
         class FakeThread:
-            def __init__(self, target, kwargs, daemon):
-                self.kwargs = kwargs
+            def __init__(self, target, kwargs, daemon, args=()):
+                self.target, self.args, self.kwargs = target, args, kwargs
+                self.is_watcher = "stop_event" in kwargs
 
             def start(self):
-                events.append("watcher_start")
-                if watcher_error:
-                    self.kwargs["failures"].append({"stage": "background_upload", "error_type": "RuntimeError"})
+                if self.is_watcher:
+                    events.append("watcher_start")
+                    if watcher_error:
+                        self.kwargs["failures"].append({"stage": "background_upload", "error_type": "RuntimeError"})
+                else:
+                    self.target(*self.args, **self.kwargs)
 
-            def join(self):
-                self_outer.assertTrue(self.kwargs["stop_event"].is_set())
-                events.append("watcher_joined")
+            def join(self, timeout):
+                if self.is_watcher:
+                    self_outer.assertTrue(self.kwargs["stop_event"].is_set())
+                    events.append("watcher_joined")
+
+            def is_alive(self):
+                return False
 
         self_outer = self
         effect = iter(final_effect or [None])
@@ -500,6 +565,98 @@ class BaselineLoggingTests(unittest.TestCase):
         self.assertEqual(events, [])
         state = json.loads((self.root / "state.json").read_text())
         self.assertEqual(state["final_sync"]["attempts"], 0)
+
+    def test_blocked_background_or_final_sync_is_bounded_without_parallel_writer(self):
+        for stage in ("background", "final"):
+            with self.subTest(stage=stage):
+                release = threading.Event()
+                finished = threading.Event()
+                sentinel = self.root / "state.json"
+                sentinel.write_text('{"uploaded": {"prior": true}}')
+
+                def block(**kwargs):
+                    try:
+                        release.wait(5)
+                    finally:
+                        finished.set()
+
+                args = self.wrapper_args()
+                args.sync_timeout_seconds = .1
+                process = mock.Mock()
+                process.wait.return_value = 0
+                with mock.patch.object(self.wrapper, "parse_args", return_value=args), \
+                     mock.patch.object(self.wrapper.signal, "signal"), \
+                     mock.patch.object(self.wrapper.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(self.wrapper, "_watch_checkpoints", side_effect=block if stage == "background" else None), \
+                     mock.patch.object(self.wrapper, "_final_sync", side_effect=block if stage == "final" else None) as final:
+                    try:
+                        with self.assertRaisesRegex(self.wrapper.SyncTimeout, stage):
+                            self.wrapper.main()
+                        self.assertEqual(final.call_count, int(stage == "final"))
+                        self.assertEqual(sentinel.read_text(), '{"uploaded": {"prior": true}}')
+                    finally:
+                        release.set()
+                        self.assertTrue(finished.wait(1))
+
+    def test_wrapper_cli_exits_124_even_with_stalled_sdk_executor(self):
+        launcher = self.root / "llamafactory-cli"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o700)
+        (self.root / "mlflow.py").write_text(
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from time import sleep\n"
+            "def set_tracking_uri(uri):\n"
+            "    pass\n"
+            "class MlflowClient:\n"
+            "    def get_experiment_by_name(self, name):\n"
+            "        with ThreadPoolExecutor() as pool:\n"
+            "            return pool.submit(sleep, 60).result()\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "scripts/train_with_checkpoint_sync.py"),
+             "--experiment", "cpu", "--run-uuid", RUN_UUID, "--yaml-config", str(self.config),
+             "--output-dir", str(self.output), "--project-dir", str(self.root),
+             "--run-name", "cpu", "--sync-timeout-seconds", "1"],
+            cwd=self.root, env=dict(self.env, PATH=str(self.root), PYTHONPATH=str(self.root)),
+            text=True, capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("Timed out waiting for background checkpoint sync", result.stderr)
+
+    def test_post_stop_timeout_terminates_a_real_stalled_cpu_process(self):
+        marker = self.root / "stop-step-reached"
+        marker.touch()
+        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              start_new_session=True) as process:
+            try:
+                self.assertEqual(self.wrapper._wait_for_training(process, marker, .05, []), 124)
+                self.assertIsNotNone(process.poll())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process group discovery")
+    def test_timeout_signals_a_rank_in_its_own_process_group(self):
+        import signal
+
+        rank = "import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print(os.getpid(), flush=True); time.sleep(60)"
+        launcher = ("import signal, subprocess, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "subprocess.run([sys.executable, '-c', sys.argv[1]], start_new_session=True)")
+        with subprocess.Popen([sys.executable, "-c", launcher, rank], start_new_session=True,
+                              stdout=subprocess.PIPE, text=True) as process:
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(3), "CPU rank did not start")
+                rank_pid = int(process.stdout.readline())
+                with mock.patch.object(self.wrapper.os, "killpg", wraps=os.killpg) as kill_group:
+                    self.wrapper._terminate_training(process, grace_seconds=.05)
+                kill_group.assert_any_call(rank_pid, signal.SIGTERM)
+                kill_group.assert_any_call(rank_pid, signal.SIGKILL)
+                self.assertEqual(process.poll(), -signal.SIGKILL)
+            finally:
+                if process.poll() is None:
+                    self.wrapper._terminate_training(process, grace_seconds=.05)
 
 
 if __name__ == "__main__":

@@ -344,17 +344,9 @@ def main(argv=None):
     if args.resume_checkpoint:
         if overrides is None:
             raise ValueError("Resume requires runtime YAML overrides")
-        from scripts.dagshub_checkpoint import _validate_checkpoint
+        from scripts.dagshub_checkpoint import validate_resume_target
         checkpoint = (Path(args.project_dir) / args.resume_checkpoint).resolve()
-        _validate_checkpoint(checkpoint, True, world_size=2, fp16=True)
-        resume_state = json.loads((checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
-        epoch = resume_state.get("epoch")
-        step = resume_state.get("global_step")
-        target = overrides.get("num_train_epochs")
-        if (type(epoch) not in (int, float) or not math.isfinite(epoch) or epoch < 0
-                or type(step) is not int or step < 1
-                or type(target) not in (int, float) or not math.isfinite(target) or target <= epoch):
-            raise ValueError("Resume needs valid saved step/epoch and a total target greater than saved epoch")
+        resume_state = validate_resume_target(checkpoint, overrides.get("num_train_epochs"))
     names = overrides["dataset"] if overrides is not None else args.datasets
     if not names:
         raise ValueError("Dataset names are required")
