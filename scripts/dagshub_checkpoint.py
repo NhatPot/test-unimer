@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,33 +37,52 @@ FULL_CHECKPOINT_FILES = (
 TRAINING_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 
 
-def _verify_training_adapter(directory, run_id, weights_sha256, base_revision):
+def _verify_training_adapter(directory, run_id, weights_sha256, base_revision, artifact_path):
     manifest = read_json_object(directory / "artifact_manifest.json")
     files = manifest["files"]
     if manifest["file_count"] != len(files):
-        raise ValueError("Training artifact manifest file count mismatch")
-    entries = [entry for entry in files if entry["path"] in TRAINING_ADAPTER_FILES]
-    if sorted(entry["path"] for entry in entries) != sorted(TRAINING_ADAPTER_FILES):
-        raise ValueError("Training artifact manifest must cover each root adapter file exactly once")
-    adapter_files = {entry["path"]: entry for entry in entries}
+        raise ValueError("Adapter artifact manifest file count mismatch")
+    prefix = ""
+    if artifact_path != "training":
+        if (manifest.get("schema_version"), manifest.get("run_id"), manifest.get("artifact_path")) != (
+            1, run_id, artifact_path,
+        ):
+            raise ValueError("Adapter checkpoint manifest does not match the requested run and artifact")
+        prefix = PurePosixPath(artifact_path).name + "/"
+    expected_paths = {prefix + name for name in TRAINING_ADAPTER_FILES}
+    entries = [entry for entry in files if entry["path"] in expected_paths]
+    if len(entries) != len(expected_paths) or {entry["path"] for entry in entries} != expected_paths:
+        raise ValueError("Artifact manifest must cover each root adapter file exactly once")
+    adapter_files = {entry["path"][len(prefix):]: entry for entry in entries}
     if adapter_files["adapter_model.safetensors"]["sha256"] != weights_sha256:
         raise ValueError("Training adapter manifest does not match the pinned weights SHA256")
     return validate_checkpoint(
         directory / "adapter",
         {"files": adapter_files, "base_model": BASE_MODEL, "run_id": run_id,
-         "artifact_path": "training", "global_step": None, "base_revision": base_revision},
+         "artifact_path": artifact_path, "global_step": None, "base_revision": base_revision},
         mode="warm-start", base_revision=base_revision,
     )["checkpoint"]
 
 
-def prepare_training_adapter(project_dir, output_dir, run_id, weights_sha256, base_revision):
-    """Fetch and hash only the root LoRA weights/config from MLflow training/."""
+def prepare_training_adapter(project_dir, output_dir, run_id, weights_sha256, base_revision,
+                             artifact_path="training"):
+    """Fetch and hash only the LoRA weights/config from the selected MLflow artifact."""
     require_hex(run_id, 32, "MLflow run ID")
     require_hex(weights_sha256, 64, "adapter weights SHA256")
     require_hex(base_revision, 40, "adapter base revision")
-    destination = require_regular_path(_resolve_path(project_dir, output_dir) / run_id)
+    artifact = PurePosixPath(artifact_path)
+    if (artifact.is_absolute() or ".." in artifact.parts or artifact.as_posix() != artifact_path
+            or (artifact_path != "training" and not re.fullmatch(r"checkpoint-[0-9]+", artifact.name))):
+        raise ValueError("Adapter source must name training or a checkpoint directory")
+    destination = _resolve_path(project_dir, output_dir) / run_id
+    manifest_artifact = "training/artifact_manifest.json"
+    if artifact_path != "training":
+        # Keep the checkpoint cache separate from the root-adapter cache for the same run.
+        destination = destination.with_name(f"{run_id}-checkpoints") / artifact
+        manifest_artifact = checkpoint_manifest_artifact(artifact_path)
+    destination = require_regular_path(destination)
     if destination.exists():
-        return _verify_training_adapter(destination, run_id, weights_sha256, base_revision)
+        return _verify_training_adapter(destination, run_id, weights_sha256, base_revision, artifact_path)
 
     mlflow = _configure_mlflow()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -70,15 +90,22 @@ def prepare_training_adapter(project_dir, output_dir, run_id, weights_sha256, ba
         staging = Path(temp) / "verified"
         adapter = staging / "adapter"
         adapter.mkdir(parents=True)
-        for name in ("artifact_manifest.json", *TRAINING_ADAPTER_FILES):
+        sources = {staging / "artifact_manifest.json": manifest_artifact}
+        sources.update({adapter / name: f"{artifact_path}/{name}" for name in TRAINING_ADAPTER_FILES})
+        for local_path, remote_path in sources.items():
             downloaded = Path(mlflow.artifacts.download_artifacts(
-                run_id=run_id, artifact_path=f"training/{name}", dst_path=temp,
+                run_id=run_id, artifact_path=remote_path, dst_path=temp,
             ))
-            shutil.copyfile(require_regular_path(downloaded), (staging if name == "artifact_manifest.json" else adapter) / name)
-        _verify_training_adapter(staging, run_id, weights_sha256, base_revision)
+            shutil.copyfile(require_regular_path(downloaded), local_path)
+        _verify_training_adapter(staging, run_id, weights_sha256, base_revision, artifact_path)
         if destination.exists():
-            return _verify_training_adapter(destination, run_id, weights_sha256, base_revision)
-        staging.rename(destination)
+            return _verify_training_adapter(destination, run_id, weights_sha256, base_revision, artifact_path)
+        try:
+            staging.rename(destination)
+        except OSError:
+            if not destination.is_dir():
+                raise
+            return _verify_training_adapter(destination, run_id, weights_sha256, base_revision, artifact_path)
     return str(destination / "adapter")
 
 
@@ -478,7 +505,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest-artifact", help="Legacy run manifest path (default: training/artifact_manifest.json)")
     parser.add_argument("--training-output-dir", help="Relocate saved best checkpoint for load_best_model_at_end")
     parser.add_argument("--expected-run-tags", type=json.loads, help="Required source tags for full resume")
-    parser.add_argument("--adapter-sha256", help="Download only the pinned root adapter from training/")
+    parser.add_argument("--adapter-sha256", help="Download only the pinned adapter from the selected artifact")
     parser.add_argument("--adapter-base-revision", help="Pinned base revision in adapter-only mode")
     return parser.parse_args()
 
@@ -486,11 +513,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.adapter_sha256 is not None:
-        if (args.artifact_path != "training" or args.training_output_dir or args.run_uuid
+        if (args.training_output_dir or args.run_uuid
                 or args.expected_run_tags is not None or args.manifest_artifact):
-            raise ValueError("Adapter-only mode requires a run ID and the root training artifact")
+            raise ValueError("Adapter-only mode requires a run ID and uses the selected artifact's manifest")
         adapter = prepare_training_adapter(args.project_dir, args.output_dir, args.run_id,
-                                           args.adapter_sha256, args.adapter_base_revision)
+                                           args.adapter_sha256, args.adapter_base_revision, args.artifact_path)
         state_path = Path(args.state_path)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps({"adapter": adapter, "sha256": args.adapter_sha256}), encoding="utf-8")

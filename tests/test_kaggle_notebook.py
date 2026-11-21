@@ -44,14 +44,15 @@ class KaggleNotebookTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def namespace(self, variant="onpolicy", smoke_steps=None):
+    def namespace(self, variant="onpolicy", smoke_steps=None, stage="K2"):
         with mock.patch.dict(os.environ), contextlib.redirect_stdout(io.StringIO()):
             namespace = {}
             source = self.sources[1].replace('K2_VARIANT = "onpolicy"', f'K2_VARIANT = "{variant}"')
+            source = source.replace('TRAIN_STAGE = "K2"', f'TRAIN_STAGE = "{stage}"')
             source = source.replace("SMOKE_STEPS = None", f"SMOKE_STEPS = {smoke_steps!r}")
             exec(compile(source, "cell-1", "exec"), namespace)
             namespace["config_env"] = {
-                key: os.environ[key] for key in ("EXPERIMENT_VARIANT", "SMOKE_STEPS", "MLFLOW_TAGS")
+                key: os.environ[key] for key in ("EXPERIMENT_VARIANT", "SMOKE_STEPS", "MLFLOW_TAGS", "TRAIN_STAGE")
             }
             exec(compile(self.resume_source, "cell-resume", "exec"), namespace)
         return namespace
@@ -65,15 +66,16 @@ class KaggleNotebookTests(unittest.TestCase):
         values["model_revision"] = self.namespace()["MODEL_REVISION"]
         return values
 
-    def runtime_namespace(self, variant="onpolicy", *, smoke_steps=None, row_copies=1, replay_size=18):
+    def runtime_namespace(self, variant="onpolicy", *, smoke_steps=None, row_copies=1, replay_size=18,
+                          stage="K2"):
         project = self.root / "project"
         (project / "scripts").mkdir(parents=True, exist_ok=True)
         (project / "train").mkdir(exist_ok=True)
         for name in ("scripts/runtime_yaml.py", "scripts/prepare_baseline_data.py",
-                     "scripts/dagshub_checkpoint.py",
+                     "scripts/dagshub_checkpoint.py", "scripts/prepare_k2_data.py", "scripts/prepare_k3_data.py",
                      "scripts/checkpoint_contract.py", "train/Uni-MuMER-train.yaml", "train/dataset_info.json"):
             shutil.copyfile(ROOT / name, project / name)
-        namespace = self.namespace(variant, smoke_steps)
+        namespace = self.namespace(variant, smoke_steps, stage)
         namespace.update(PROJECT_DIR=str(project), PYTHON=sys.executable, RUN_TRAINING=True,
                          RUNTIME_YAML_CONFIG=str(self.root / "runtime.yaml"), RUN_DIR=str(self.root / "run"),
                          OUTPUT_DIR=str(self.root / "output"), K1_DATASET_DIR=str(self.root / "K1_datascale_sft"),
@@ -203,6 +205,7 @@ class KaggleNotebookTests(unittest.TestCase):
     def test_single_training_switch_defaults_off(self):
         namespace = self.namespace()
         self.assertIs(namespace["RUN_TRAINING"], False)
+        self.assertEqual(namespace["TRAIN_STAGE"], "K2")
         for obsolete in ("ALLOW_SETUP", "ALLOW_TRAINING", "ALLOW_REMOTE_WRITES",
                          "PIPELINE_REVIEW_COMPLETE", "SOURCE_COMMIT",
                          "MINICONDA_INSTALLER_SHA256"):
@@ -431,6 +434,12 @@ class KaggleNotebookTests(unittest.TestCase):
                 smoke = self.runtime_namespace(variant, smoke_steps=6, row_copies=20, replay_size=1800)
                 smoke_env = self.run_runtime(smoke)
                 smoke_path = Path(smoke_env["YAML_CONFIG"])
+                pre_k3_sha256 = {
+                    "onpolicy": "e06269f8ed30102617e7cffcf0d90dddafc8f53a8530ed8eff4596dbd8adc4d5",
+                    "control": "e7abb69cb89398a4ff07a36ad6c8a039d5c1d29b67b9294787176fe5aa6e684a",
+                }
+                normalized = smoke_path.read_bytes().replace(bytes(self.root), b"/fixture")
+                self.assertEqual(hashlib.sha256(normalized).hexdigest(), pre_k3_sha256[variant])
                 smoke_config = yaml.safe_load(smoke_path.read_bytes())
                 smoke_data = Path(smoke["DATASET_DIR"])
                 self.assertEqual(smoke_config, dict(normal_config, dataset="k2_train_smoke",
@@ -808,9 +817,80 @@ class KaggleNotebookTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[:5], ["--kill-after=30s", "30m", "/own-env/bin/python",
                                                          "scripts/dagshub_logger.py", "upload"])
 
+    def test_k3_runtime_uses_verified_adapter_and_crohme_schedule(self):
+        namespace = self.runtime_namespace(stage="K3", row_copies=35)
+        env = self.run_runtime(namespace)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_bytes())
+        manifest = json.loads(Path(env["SPLIT_MANIFEST"]).read_bytes())
+        steps = ceil(manifest["counts"]["train"]["rows"] / 256)
+        interval = (steps - 1) // 2
+        self.assertEqual(list(range(config["eval_steps"], steps + 1, config["eval_steps"])),
+                         [interval, 2 * interval])
+        self.assertLess(2 * interval, steps)
+        self.assertEqual(config["save_steps"], interval)
+        self.assertEqual(config["dataset"], "k3_train")
+        self.assertEqual(config["eval_dataset"], "k3_val")
+        self.assertEqual(config["max_steps"], -1)
+        self.assertEqual(config["num_train_epochs"], 1)
+        self.assertEqual(config["val_size"], 0)
+        self.assertEqual(config["learning_rate"], 1e-4)
+        self.assertEqual(config["lr_scheduler_type"], "cosine")
+        self.assertEqual(config["per_device_train_batch_size"], 4)
+        self.assertEqual(config["gradient_accumulation_steps"], 32)
+        self.assertEqual(config["quantization_type"], "nf4")
+        self.assertEqual(config["quantization_bit"], 4)
+        self.assertTrue(config["fp16"])
+        self.assertTrue(config["load_best_model_at_end"])
+        self.assertFalse(config["use_hard_example_loss"])
+        self.assertFalse(config["create_new_adapter"])
+        self.assertIsNone(config["resume_from_checkpoint"])
+        self.assertEqual(config["adapter_name_or_path"], str(self.root / "adapter"))
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["stage"], "K3")
+        self.assertEqual(tags["variant"], "K3_crohme_ft")
+        self.assertEqual(tags["initial_global_step"], "0")
+        self.assertNotIn("k2_data_sha256", tags)
+        self.assertEqual(tags["k3_data_sha256"], hashlib.sha256(Path(env["SPLIT_MANIFEST"]).read_bytes()).hexdigest())
+        [command] = self.adapter_downloads
+        self.assertEqual(command[command.index("--run-id") + 1], "c642452e996343ddaa6c5bfe48063022")
+        self.assertEqual(command[command.index("--run-id") + 1], tags["init_adapter_run_id"])
+        self.assertEqual(command[command.index("--artifact-path") + 1], "checkpoints/checkpoint-138")
+        self.assertEqual(command[command.index("--artifact-path") + 1], tags["init_adapter_artifact_path"])
+        self.assertEqual(command[command.index("--adapter-sha256") + 1],
+                         "0e0f855fcf783ab496e7fd3ca89da5ba05a636b262c5bb497038d597565047c4")
+        self.assertEqual(command[command.index("--adapter-sha256") + 1], tags["init_adapter_sha256"])
+
+        namespace["K3_EVAL_SAVE_INTERVAL"] = steps
+        self.run_runtime(namespace)
+        config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_bytes())
+        self.assertEqual((config["eval_steps"], config["save_steps"]), (steps, steps))
+        namespace["K3_EVAL_SAVE_INTERVAL"] = 0
+        with self.assertRaisesRegex(ValueError, "K3_EVAL_SAVE_INTERVAL"):
+            self.run_runtime(namespace)
+
+    def test_k3_rejects_k2_smoke_and_resume_inputs(self):
+        with self.assertRaisesRegex(ValueError, "SMOKE_STEPS"):
+            self.namespace(stage="K3", smoke_steps=6)
+        with self.assertRaisesRegex(ValueError, "TRAIN_STAGE"):
+            self.namespace(stage="unknown")
+        with mock.patch.dict(os.environ), self.assertRaisesRegex(ValueError, "K3_INIT"):
+            exec(self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True"),
+                 self.namespace(stage="K3"))
+
+    def test_k3_training_keeps_the_final_step_watchdog(self):
+        fake = self.root / "python"
+        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        fake.chmod(0o700)
+        result = self.bash(8, RUN_TRAINING="1", PROJECT_DIR=str(self.root), TRAIN_STAGE="K3",
+                           YAML_CONFIG="runtime.yaml", OUTPUT_DIR=str(self.root / "new"),
+                           PYTHON=str(fake), RUN_UUID="a" * 32, SYNC_STATE_PATH="run/state.json",
+                           MLFLOW_EXPERIMENT_NAME="experiment", EXPERIMENT_VARIANT="K3_crohme_ft")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-2:], ["--post-final-timeout-seconds", "2700"])
+
     def test_notebook_source_is_shorter_and_setup_readable(self):
         active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source, self.k1_source])
-        self.assertLess(active, 420)  # Includes smoke sizing and the final-step watchdog.
+        self.assertLess(active, 460)  # Includes K2 smoke sizing and the K3 configuration.
         self.assertLess(len(self.sources[2].splitlines()), 22)
 
     def test_summary_cli_is_opt_in_and_does_not_include_arbitrary_secrets(self):

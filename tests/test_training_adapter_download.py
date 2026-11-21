@@ -70,3 +70,45 @@ class TrainingAdapterDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "root adapter file"):
             self.prepare()
         self.assertFalse((self.root / "cache" / self.run_id).exists())
+
+    def test_checkpoint_warm_start_validates_manifest_identity_and_downloads_only_adapter(self):
+        artifact = "checkpoints/checkpoint-138"
+        manifest = {"schema_version": 1, "run_id": self.run_id, "artifact_path": artifact,
+                    **json.loads(self.manifest.read_text())}
+        for entry in manifest["files"]:
+            if "/" not in entry["path"]:
+                entry["path"] = "checkpoint-138/" + entry["path"]
+        self.manifest.write_text(json.dumps(manifest))
+        manifest_artifact = "checkpoint_manifests/checkpoint-138.json"
+        expected = {
+            manifest_artifact: self.manifest,
+            **{f"{artifact}/{name}": self.remote / name for name in downloader.TRAINING_ADAPTER_FILES},
+        }
+
+        def download(*, artifact_path, run_id, dst_path):
+            self.assertEqual(run_id, self.run_id)
+            source = expected[artifact_path]
+            return shutil.copyfile(source, Path(dst_path) / source.name)
+
+        self.mlflow.artifacts.download_artifacts.side_effect = download
+
+        def prepare():
+            return Path(downloader.prepare_training_adapter(
+                self.root, "cache", self.run_id, self.weights_sha, self.revision, artifact,
+            ))
+
+        manifest["artifact_path"] = "checkpoints/checkpoint-69"
+        self.manifest.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "does not match the requested run and artifact"):
+            prepare()
+        self.mlflow.artifacts.download_artifacts.reset_mock()
+        manifest["artifact_path"] = artifact
+        self.manifest.write_text(json.dumps(manifest))
+        path = prepare()
+        self.assertEqual(prepare(), path)
+        self.assertEqual({file.name for file in path.iterdir()}, set(downloader.TRAINING_ADAPTER_FILES))
+        self.assertEqual([call.kwargs["artifact_path"] for call in self.mlflow.artifacts.download_artifacts.call_args_list],
+                         list(expected))
+        (path / self.weights.name).write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "Checkpoint file hash mismatch"):
+            prepare()

@@ -91,7 +91,7 @@ def _read_k1(directory, expected_sha256):
     return schema, by_source, val_records
 
 
-def _filter_b4(manifest_path, expected_sha256, k1_by_source, k1_val):
+def read_b4_manifest(manifest_path, expected_sha256):
     path = require_regular_path(Path(manifest_path))
     raw = path.read_bytes()
     if path.suffix == ".gz":
@@ -102,7 +102,11 @@ def _filter_b4(manifest_path, expected_sha256, k1_by_source, k1_val):
     if (manifest.get("schema_version") != 1
             or manifest.get("grouping") != "source_family_id_or_decoded_rgb_sha256"):
         raise ValueError("K2 requires the B4 image-grouped split")
+    return manifest
 
+
+def _filter_b4(manifest_path, expected_sha256, k1_by_source, k1_val):
+    manifest = read_b4_manifest(manifest_path, expected_sha256)
     splits = {"train": set(), "val": set()}
     for record in manifest["records"]:
         splits[record["split"]].add((record["source"], record["row"]))
