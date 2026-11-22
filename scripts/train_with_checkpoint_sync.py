@@ -17,10 +17,10 @@ from typing import Any
 
 if __name__ == "__main__" and not __package__:
     from checkpoint_contract import sha256_file
-    from dagshub_checkpoint import checkpoint_manifest_artifact
+    from dagshub_checkpoint import _validate_checkpoint, checkpoint_manifest_artifact
 else:
     from scripts.checkpoint_contract import sha256_file
-    from scripts.dagshub_checkpoint import checkpoint_manifest_artifact
+    from scripts.dagshub_checkpoint import _validate_checkpoint, checkpoint_manifest_artifact
 
 
 CHECKPOINT_FILE_CANDIDATES = (
@@ -188,6 +188,7 @@ def _sync_checkpoints_once(
     stable_seconds: int,
     require_full_checkpoint: bool,
     final: bool = False,
+    required_final_step: int | None = None,
 ) -> int:
     state = _load_state(state_path)
     identity = {"run_id": run_id, "artifact_path": artifact_path.strip("/"),
@@ -214,6 +215,11 @@ def _sync_checkpoints_once(
             stable_seconds=stable_seconds,
             require_full_checkpoint=require_full_checkpoint,
         )
+        if snapshot is not None and required_final_step is not None:
+            try:
+                _validate_checkpoint(checkpoint_dir, True, world_size=2, fp16=True)
+            except (FileNotFoundError, RuntimeError) as error:
+                snapshot, reason = None, str(error)
         if snapshot is None:
             if final:
                 raise RuntimeError(f"Final checkpoint is not ready: {name} ({reason})")
@@ -252,6 +258,21 @@ def _sync_checkpoints_once(
         state["latest"] = name
         _save_state(state_path, state)
         uploaded_count += 1
+
+    if final and required_final_step is not None:
+        latest = output_dir / f"checkpoint-{required_final_step}"
+        _validate_checkpoint(latest, True, world_size=2, fp16=True)
+        latest_state = json.loads((latest / "trainer_state.json").read_text(encoding="utf-8"))
+        if latest_state.get("global_step") != required_final_step or not latest_state.get("best_model_checkpoint"):
+            raise RuntimeError("Final Trainer state must record the expected global step and best checkpoint")
+        best = output_dir / Path(latest_state["best_model_checkpoint"]).name
+        if _checkpoint_step(best) < 0:
+            raise RuntimeError("Invalid best checkpoint name in final Trainer state")
+        _validate_checkpoint(best, True, world_size=2, fp16=True)
+        for checkpoint in (latest, best):
+            if checkpoint.name not in uploaded:
+                raise RuntimeError(f"Required checkpoint and manifest were not submitted: {checkpoint.name}")
+        print(f"[checkpoint-sync] Submitted required latest {latest.name} and best {best.name}.", flush=True)
 
     return uploaded_count
 
@@ -294,6 +315,7 @@ def _watch_checkpoints(
     failures: list[dict[str, str]] | None = None,
     log_path: Path | None = None,
     stack_dump_dir: Path | None = None,
+    required_final_step: int | None = None,
 ) -> None:
     failures = failures if failures is not None else []
     try:
@@ -319,6 +341,7 @@ def _watch_checkpoints(
                     state_path=state_path,
                     stable_seconds=stable_seconds,
                     require_full_checkpoint=require_full_checkpoint,
+                    required_final_step=required_final_step,
                 )
                 if count:
                     print(f"[checkpoint-sync] Submitted {count} checkpoint(s); remote content not verified", flush=True)
@@ -343,6 +366,7 @@ def _final_sync(
     state_path: Path,
     stable_seconds: int,
     require_full_checkpoint: bool,
+    required_final_step: int | None = None,
 ) -> None:
     if not output_dir.is_dir():
         raise FileNotFoundError("Training output directory missing during final checkpoint sync")
@@ -359,6 +383,7 @@ def _final_sync(
         stable_seconds=stable_seconds,
         require_full_checkpoint=require_full_checkpoint,
         final=True,
+        required_final_step=required_final_step,
     )
     print(f"[checkpoint-sync] Final checkpoint pass submitted {count} checkpoint(s); "
           "not remote-verified. Full output upload/verification remains with dagshub_logger.", flush=True)
@@ -563,6 +588,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-seconds", type=int, default=20)
     parser.add_argument("--state-path", default="/kaggle/working/checkpoint_sync_state.json")
     parser.add_argument("--allow-model-only", action="store_true")
+    parser.add_argument("--require-final-checkpoint-step", type=int,
+                        help="Require the final step and its best checkpoint with full two-GPU FP16 state")
     parser.add_argument("--resume-best-checkpoint", default="")
     parser.add_argument("--resume-prepared-output", default="")
     parser.add_argument("--post-stop-timeout-seconds", type=int, default=POST_STOP_TIMEOUT_SECONDS,
@@ -575,6 +602,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if min(args.post_stop_timeout_seconds, args.post_final_timeout_seconds, args.sync_timeout_seconds) <= 0:
         parser.error("timeout values must be positive")
+    if args.require_final_checkpoint_step is not None and (
+            args.require_final_checkpoint_step < 1 or args.allow_model_only):
+        parser.error("A required final checkpoint needs a positive step and full checkpoint sync")
     return args
 
 
@@ -625,6 +655,8 @@ def main() -> None:
         "output_dir": output_dir, "artifact_path": args.artifact_path,
         "state_path": state_path, "require_full_checkpoint": not args.allow_model_only,
     }
+    if getattr(args, "require_final_checkpoint_step", None) is not None:
+        sync_args["required_final_step"] = args.require_final_checkpoint_step
     watcher = threading.Thread(
         target=_watch_checkpoints,
         kwargs={

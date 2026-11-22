@@ -18,6 +18,8 @@ from unittest import mock
 
 import yaml
 from scripts import prepare_k2_data as k2
+from scripts import prepare_baseline_data as baseline
+from scripts.checkpoint_storage import activate_resume, stage_resume
 from scripts.prepare_baseline_data import prepare_from_rows
 from scripts.prepare_k2_data import prepare_k2_data
 TESTS_DIR = Path(__file__).resolve().parent
@@ -151,6 +153,49 @@ class KaggleNotebookTests(unittest.TestCase):
             b4_manifest=namespace["BASE_SPLIT_MANIFEST"], expected_b4_sha256=namespace["BASE_SPLIT_SHA256"],
         )
         namespace["RESUME_DATA_SHA256"] = result["manifest_sha256"]
+
+    def run_a_noweight(self, namespace, *, training=True, counts=None, wrong_sha=False):
+        namespace.update(PROJECT_DIR=str(ROOT), PYTHON=sys.executable, RUN_TRAINING=training)
+        counts = {"train_rows": 43242, "val_rows": 4758} if counts is None else counts
+        manifest = json.loads(gzip.decompress((ROOT / namespace["BASE_SPLIT_MANIFEST"]).read_bytes()))
+        manifest_sha = "0" * 64 if wrong_sha else namespace["BASE_SPLIT_SHA256"]
+
+        def prepare(project, names, directory, **kwargs):
+            self.assertEqual(project, str(ROOT))
+            self.assertEqual(names.split(", "), manifest["settings"]["datasets"])
+            self.assertEqual(directory, "/kaggle/working/baseline-data/n8000-v0.1-s42")
+            self.assertEqual(kwargs, dict(max_samples=8000, val_ratio=0.1, seed=42,
+                                          dataset_revision=manifest["source_revisions"]["phxember/Uni-MuMER-Data"],
+                                          max_samples_by_source=None, base_manifest=None, base_manifest_sha256=None))
+            return dict(dataset_dir=directory, train_dataset="baseline_train", eval_dataset="baseline_val",
+                        manifest_path=f"{directory}/split_manifest.json", manifest_sha256=manifest_sha, counts=counts)
+
+        def run_fixture(command, **kwargs):
+            self.assertEqual(command[:3], [sys.executable, "-m", "scripts.prepare_baseline_data"])
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                baseline.main(command[3:])
+            return subprocess.CompletedProcess(command, 0, stdout.getvalue(), "")
+
+        with mock.patch.dict(os.environ, namespace["config_env"]), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch("subprocess.run", side_effect=run_fixture) as run, \
+                mock.patch.object(baseline, "prepare_baseline", side_effect=prepare):
+            exec(self.k1_source, namespace)
+            exec(self.sources[6], namespace)
+            run.assert_called_once()
+            return dict(os.environ)
+
+    def a_noweight_namespace(self):
+        namespace = self.namespace(stage="A_NOWEIGHT")
+        run_dir = self.root / "run"
+        namespace.update(RUN_DIR=str(run_dir), OUTPUT_DIR=str(run_dir / "checkpoints"),
+                         RUNTIME_YAML_CONFIG=str(run_dir / "runtime.yaml"))
+        return namespace
+
+    def assert_a_noweight_yaml_diff(self, config_path, reference, **expected_changes):
+        pinned = yaml.safe_load((TESTS_DIR / f"fixtures/a_noweight/{reference}.runtime.yaml").read_bytes())
+        actual = yaml.safe_load(Path(config_path).read_bytes())
+        self.assertEqual(actual.keys(), pinned.keys())
+        self.assertEqual({key: value for key, value in actual.items() if value != pinned[key]}, expected_changes)
 
     def bash(self, index, **environment):
         env = dict(os.environ, RUN_TRAINING="0", SMOKE_STEPS="", PATH="/nonexistent")
@@ -821,6 +866,10 @@ class KaggleNotebookTests(unittest.TestCase):
         namespace = self.runtime_namespace(stage="K3", row_copies=35)
         env = self.run_runtime(namespace)
         config = yaml.safe_load(Path(env["YAML_CONFIG"]).read_bytes())
+        normalized = Path(env["YAML_CONFIG"]).read_bytes().replace(bytes(self.root), b"/fixture")
+        # K3 runtime emitted by the pre-change notebook at 4fbcc37.
+        self.assertEqual(hashlib.sha256(normalized).hexdigest(),
+                         "f59c6a32529841c1ec40e18dff585df078835a496f3d0a8042f4269ecb98e48e")
         manifest = json.loads(Path(env["SPLIT_MANIFEST"]).read_bytes())
         steps = ceil(manifest["counts"]["train"]["rows"] / 256)
         interval = (steps - 1) // 2
@@ -890,8 +939,126 @@ class KaggleNotebookTests(unittest.TestCase):
 
     def test_notebook_source_is_shorter_and_setup_readable(self):
         active = sum(len(s.splitlines()) for s in self.sources + [self.resume_source, self.k1_source])
-        self.assertLess(active, 460)  # Includes K2 smoke sizing and the K3 configuration.
+        self.assertLess(active, 510)  # Includes K2 smoke, K3 and both A_NOWEIGHT phases.
         self.assertLess(len(self.sources[2].splitlines()), 22)
+
+    def test_a_noweight_fresh_matches_b4_reference_and_starts_from_base(self):
+        namespace = self.a_noweight_namespace()
+        self.assertEqual(namespace["RESUME_TOTAL_EPOCHS"], 4)
+        self.assertEqual(namespace["RESUME_ARTIFACT_PATH"], "checkpoints/checkpoint-338")
+        self.assertFalse(namespace["USE_DAGSHUB_RESUME"])
+        pinned_manifest = gzip.decompress((ROOT / namespace["BASE_SPLIT_MANIFEST"]).read_bytes())
+        self.assertEqual(hashlib.sha256(pinned_manifest).hexdigest(), namespace["BASE_SPLIT_SHA256"])
+        env = self.run_a_noweight(namespace)
+        self.assert_a_noweight_yaml_diff(env["YAML_CONFIG"], "b67477df", output_dir=env["OUTPUT_DIR"],
+                                        use_hard_example_loss=False)
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["stage"], "A_NOWEIGHT")
+        self.assertEqual(tags["variant"], "A_noweight_b4cfg")
+        self.assertEqual(tags["split_sha256"], namespace["BASE_SPLIT_SHA256"])
+        self.assertEqual(tags["a_noweight_data_sha256"], namespace["BASE_SPLIT_SHA256"])
+        self.assertEqual(tags["initial_global_step"], "0")
+        self.assertEqual(tags["resume"], "false")
+        self.assertNotIn("init_adapter_run_id", tags)
+        self.assertEqual(env["A_NOWEIGHT_FINAL_STEP"], "338")
+
+    def test_a_noweight_dry_run_and_data_guards(self):
+        namespace = self.a_noweight_namespace()
+        runtime = Path(namespace["RUNTIME_YAML_CONFIG"])
+        self.assertEqual(self.run_a_noweight(namespace, training=False)["YAML_CONFIG"], "")
+        self.assertFalse(runtime.exists())
+        for counts in ({"train_rows": 43241, "val_rows": 4758}, {"train_rows": 43242, "val_rows": 4757}):
+            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "đúng split B4"):
+                self.run_a_noweight(namespace, training=False, counts=counts)
+        with self.assertRaisesRegex(ValueError, "Split manifest differs"):
+            self.run_a_noweight(namespace, wrong_sha=True)
+        self.assertFalse(runtime.exists())
+        namespace["RUN_TRAINING"] = False
+        with mock.patch("subprocess.run") as run, mock.patch.dict(os.environ):
+            source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
+            with self.assertRaisesRegex(RuntimeError, "RUN_TRAINING=True"):
+                exec(source, namespace)
+            run.assert_not_called()
+
+    def test_a_noweight_resume_uses_run_tags_and_matches_b4_reference_after_activation(self):
+        namespace = self.a_noweight_namespace()
+        namespace.update(RUN_TRAINING=True, PROJECT_DIR=str(ROOT), PYTHON=sys.executable)
+        run_id = "a" * 32
+        cache = self.root / "cache"
+        checkpoint, best = (cache / f"checkpoint-{step}" for step in (338, 300))
+        for folder, step in ((checkpoint, 338), (best, 300)):
+            folder.mkdir(parents=True)
+            for name in ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
+                         "scheduler.pt", "scaler.pt", "rng_state_0.pth", "rng_state_1.pth"):
+                (folder / name).write_bytes(b"fixture only")
+            (folder / "trainer_state.json").write_text(json.dumps({
+                "global_step": step, "epoch": 2.0 if step == 338 else 1.8,
+                "best_model_checkpoint": "/previous/account/checkpoints/checkpoint-300",
+            }))
+        source = self.resume_source.replace("USE_DAGSHUB_RESUME = False", "USE_DAGSHUB_RESUME = True")
+        source = source.replace('RESUME_RUN_ID = ""', f'RESUME_RUN_ID = "{run_id}"')
+        output = Path(namespace["OUTPUT_DIR"])
+
+        def download(command, **kwargs):
+            self.assertEqual(command[:2], [sys.executable, "scripts/dagshub_checkpoint.py"])
+            self.assertEqual(command[command.index("--run-id") + 1], run_id)
+            self.assertEqual(command[command.index("--artifact-path") + 1], "checkpoints/checkpoint-338")
+            self.assertEqual(command[command.index("--world-size") + 1], "2")
+            self.assertIn("--fp16", command)
+            self.assertIn("--require-checkpoint-manifest", command)
+            self.assertNotIn("--manifest-artifact", command)
+            self.assertEqual(json.loads(command[command.index("--expected-run-tags") + 1]),
+                             dict(variant="A_noweight_b4cfg", stage="A_NOWEIGHT", initial_global_step="0",
+                                  a_noweight_data_sha256=namespace["BASE_SPLIT_SHA256"]))
+            plan = stage_resume(checkpoint, best, cache, output, run_id=run_id,
+                                artifact_path="checkpoints/checkpoint-338")
+            prepared = Path(plan["prepared_output_dir"])
+            state = Path(command[command.index("--state-path") + 1])
+            state.parent.mkdir()
+            state.write_text(json.dumps(dict(checkpoint=str(prepared / checkpoint.name),
+                                             best_checkpoint=str(prepared / best.name),
+                                             prepared_output=str(prepared))))
+
+        with mock.patch.dict(os.environ), mock.patch("subprocess.run", side_effect=download), \
+                contextlib.redirect_stdout(io.StringIO()):
+            exec(source, namespace)
+            prepared = os.environ["RESUME_PREPARED_OUTPUT"]
+        env = self.run_a_noweight(namespace)
+        self.assert_a_noweight_yaml_diff(
+            env["YAML_CONFIG"], "3a87e88b", output_dir=str(output), use_hard_example_loss=False,
+            resume_from_checkpoint=namespace["RESUME_CHECKPOINT"], adapter_name_or_path=namespace["RESUME_CHECKPOINT"],
+        )
+        self.assertFalse(output.exists())
+        activate_resume(prepared, output, env["YAML_CONFIG"], ROOT)
+        resume_path = str(output / "checkpoint-338")
+        self.assert_a_noweight_yaml_diff(
+            env["YAML_CONFIG"], "3a87e88b", output_dir=str(output), use_hard_example_loss=False,
+            resume_from_checkpoint=resume_path, adapter_name_or_path=resume_path,
+        )
+        self.assertTrue((output / "checkpoint-300/optimizer.pt").is_file())
+        tags = json.loads(env["MLFLOW_TAGS"])
+        self.assertEqual(tags["parent_run_id"], run_id)
+        self.assertEqual(tags["resume"], "true")
+        self.assertEqual(tags["initial_global_step"], "338")
+        self.assertEqual(tags["initial_epoch"], "2.0")
+        self.assertEqual(env["A_NOWEIGHT_FINAL_STEP"], "676")
+
+    def test_a_noweight_training_uses_final_step_contract_and_watchdog(self):
+        fake = self.root / "python"
+        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        fake.chmod(0o700)
+        for step in ("338", "676"):
+            with self.subTest(step=step):
+                result = self.bash(8, RUN_TRAINING="1", PROJECT_DIR=str(self.root), TRAIN_STAGE="A_NOWEIGHT",
+                                   YAML_CONFIG="runtime.yaml", OUTPUT_DIR=str(self.root / "new"),
+                                   PYTHON=str(fake), RUN_UUID="a" * 32, SYNC_STATE_PATH="run/state.json",
+                                   MLFLOW_EXPERIMENT_NAME="experiment", EXPERIMENT_VARIANT="A_noweight_b4cfg",
+                                   A_NOWEIGHT_FINAL_STEP=step)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = result.stdout.splitlines()
+                self.assertEqual(args[args.index("--post-final-timeout-seconds") + 1], "2700")
+                self.assertEqual(args[args.index("--require-final-checkpoint-step") + 1], step)
+                self.assertEqual(args[args.index("--artifact-path") + 1], "checkpoints")
 
     def test_summary_cli_is_opt_in_and_does_not_include_arbitrary_secrets(self):
         base = self.root / "base.yaml"

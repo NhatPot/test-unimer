@@ -1,6 +1,7 @@
 """CPU-only coverage for the legacy baseline logging/sync entry points."""
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from functools import partial
 import hashlib
 import importlib.util
 import io
@@ -423,6 +424,66 @@ class BaselineLoggingTests(unittest.TestCase):
             self.assertEqual(entry["sha256"], hashlib.sha256(payload).hexdigest())
         state = json.loads((self.root / "state.json").read_text())
         self.assertEqual(state["uploaded"]["checkpoint-5"]["manifest_artifact"], manifest_path)
+
+    def test_a_noweight_retains_and_syncs_full_best_and_off_interval_final(self):
+        from transformers import Trainer, TrainerControl, TrainerState
+        from transformers.trainer_callback import DefaultFlowCallback
+        from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+
+        for final_step, best_step, previous_step in ((338, 250, 300), (676, 500, 650)):
+            with self.subTest(final_step=final_step):
+                output = self.output / str(final_step)
+                best = output / f"checkpoint-{best_step}"
+                latest = output / f"checkpoint-{final_step}"
+                previous = output / f"checkpoint-{previous_step}"
+                args = SimpleNamespace(save_total_limit=2, load_best_model_at_end=True,
+                                       logging_strategy=IntervalStrategy.STEPS,
+                                       eval_strategy=IntervalStrategy.STEPS,
+                                       save_strategy=SaveStrategy.STEPS, eval_delay=0)
+                state = TrainerState(global_step=final_step, max_steps=final_step, logging_steps=1,
+                                     eval_steps=50, save_steps=50, best_model_checkpoint=str(best))
+                control = DefaultFlowCallback().on_step_end(args, state, TrainerControl())
+                self.assertTrue(control.should_save)
+                self.assertFalse(control.should_evaluate)
+                required_files = ("adapter_config.json", "adapter_model.safetensors", "optimizer.pt",
+                                  "scheduler.pt", "scaler.pt", "rng_state_0.pth", "rng_state_1.pth")
+                for checkpoint in (best, previous, latest):
+                    checkpoint.mkdir(parents=True)
+                    for name in required_files:
+                        (checkpoint / name).write_bytes(name.encode())
+                    state.save_to_json(str(checkpoint / "trainer_state.json"))
+
+                trainer = SimpleNamespace(args=args, state=state)
+                trainer._sorted_checkpoints = partial(Trainer._sorted_checkpoints, trainer)
+                Trainer._rotate_checkpoints(trainer, output_dir=output)
+                self.assertEqual(set(output.iterdir()), {best, latest})
+                self.wrapper._final_sync("baseline", RUN_UUID, output, "checkpoints", output / "sync.json",
+                                         0, True, required_final_step=final_step)
+                for checkpoint in (best, latest):
+                    manifest = json.loads(self.sdk.client.files[f"checkpoint_manifests/{checkpoint.name}.json"])
+                    files = {entry["path"]: entry["sha256"] for entry in manifest["files"]}
+                    for name in (*required_files, "trainer_state.json"):
+                        path = f"{checkpoint.name}/{name}"
+                        self.assertEqual(self.sdk.client.files[f"checkpoints/{path}"], (checkpoint / name).read_bytes())
+                        self.assertEqual(files[path], hashlib.sha256((checkpoint / name).read_bytes()).hexdigest())
+
+    def test_required_final_sync_fails_for_missing_latest_or_incomplete_amp_state(self):
+        def final():
+            self.wrapper._final_sync("baseline", RUN_UUID, self.output, "checkpoints",
+                                     self.root / "state.json", 0, True, required_final_step=338)
+
+        with self.assertRaisesRegex(FileNotFoundError, "checkpoint-338"):
+            final()
+        checkpoint = self.checkpoint("checkpoint-338")
+        (checkpoint / "trainer_state.json").write_text('{"global_step": 338, "best_model_checkpoint": "checkpoint-300"}')
+        for name in ("adapter_config.json", "rng_state_0.pth", "rng_state_1.pth"):
+            (checkpoint / name).write_bytes(b"test")
+        with self.assertRaisesRegex(RuntimeError, "scaler.pt"):
+            final()
+        self.assertFalse(self.sdk.client.files)
+        (checkpoint / "scaler.pt").write_bytes(b"test")
+        with self.assertRaisesRegex(FileNotFoundError, "checkpoint-300"):
+            final()
 
     def test_failed_manifest_upload_is_not_acknowledged_and_is_retried(self):
         self.checkpoint()

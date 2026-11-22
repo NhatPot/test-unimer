@@ -117,6 +117,36 @@ class ResumeDownloadTests(unittest.TestCase):
         self.assertEqual(paths, ["checkpoints/checkpoint-338", "checkpoint_manifests/checkpoint-338.json",
                                  "checkpoints/checkpoint-300", "checkpoint_manifests/checkpoint-300.json"])
 
+    def test_required_manifests_check_data_tag_and_verify_latest_and_best(self):
+        self.add_best()
+        self.write_specific("checkpoint-338")
+        expected = {"variant": "A_noweight_b4cfg", "stage": "A_NOWEIGHT", "a_noweight_data_sha256": "b" * 64}
+        source_tags = dict(expected, a_noweight_data_sha256="c" * 64)
+        self.client.MlflowClient.return_value.get_run.return_value = SimpleNamespace(
+            data=SimpleNamespace(tags=source_tags)
+        )
+        options = dict(artifact_path="checkpoints/checkpoint-338", training_output_dir=self.root / "output",
+                       require_checkpoint_manifest=True, expected_run_tags=expected)
+        with self.assertRaisesRegex(ValueError, "Resume source tag mismatch: a_noweight_data_sha256"):
+            self.prepare(**options)
+        self.client.artifacts.download_artifacts.assert_not_called()
+        source_tags.update(expected)
+        with self.assertRaisesRegex(FileNotFoundError, "Required SHA256 manifest missing: .*checkpoint-300"):
+            self.prepare(**options)  # The legacy training manifest is present.
+        self.write_specific("checkpoint-300")
+        checkpoint = self.prepare(**options)
+        self.assertEqual(checkpoint.name, "checkpoint-338")
+        self.assertEqual((checkpoint.parent / "checkpoint-300/scaler.pt").read_bytes(),
+                         (self.remote.parent / "checkpoint-300/scaler.pt").read_bytes())
+        self.assertEqual(self.prepare(**options), checkpoint)
+
+    def test_required_manifest_rejects_legacy_prepared_cache(self):
+        output = self.root / "new-output"
+        options = dict(artifact_path="checkpoints/checkpoint-338", training_output_dir=output)
+        self.prepare(**options)
+        with self.assertRaisesRegex(FileNotFoundError, "Required SHA256 manifest missing: .*checkpoint-338"):
+            self.prepare(**options, require_checkpoint_manifest=True)
+
     def test_bad_checkpoint_manifest_does_not_downgrade_to_legacy_or_sizes(self):
         manifest = self.write_specific("checkpoint-338")
         content = json.loads(manifest.read_text())

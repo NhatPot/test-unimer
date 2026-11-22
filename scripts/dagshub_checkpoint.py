@@ -150,7 +150,8 @@ def _checkpoint_entries(client, run_id: str, artifact_path: str) -> dict[str, in
     return files
 
 
-def _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, legacy_manifest):
+def _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, legacy_manifest,
+                                *, require_checkpoint_manifest=False):
     client = mlflow.MlflowClient()
     specific_manifest = checkpoint_manifest_artifact(artifact_path)
     local_files = {}
@@ -162,7 +163,10 @@ def _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint,
         if path.is_file():
             local_files[path.relative_to(local_checkpoint).as_posix()] = path
 
-    for manifest_artifact in (specific_manifest, legacy_manifest or "training/artifact_manifest.json"):
+    candidates = [specific_manifest]
+    if not require_checkpoint_manifest:
+        candidates.append(legacy_manifest or "training/artifact_manifest.json")
+    for manifest_artifact in candidates:
         if not _manifest_exists(client, run_id, manifest_artifact):
             continue
         manifest_dir = output_path / "manifest"
@@ -207,6 +211,8 @@ def _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint,
         print(f"Checkpoint bytes match {manifest_artifact} (SHA256).")
         return
 
+    if require_checkpoint_manifest:
+        raise FileNotFoundError(f"Required SHA256 manifest missing: {specific_manifest}")
     remote_sizes = _checkpoint_entries(client, run_id, artifact_path)
     local_sizes = {name: path.stat().st_size for name, path in local_files.items()}
     if remote_sizes != local_sizes:
@@ -320,6 +326,7 @@ def prepare_resume_checkpoint(
     manifest_artifact: str | None = None,
     training_output_dir: str | Path | None = None,
     expected_run_tags: dict[str, str] | None = None,
+    require_checkpoint_manifest: bool = False,
 ) -> str | None:
     """Download a DagsHub MLflow checkpoint artifact for LLaMA-Factory resume."""
     print(f"DagsHub Resume: {'ON' if enabled else 'OFF'}")
@@ -354,6 +361,9 @@ def prepare_resume_checkpoint(
             if tags.get(name) != expected:
                 raise ValueError(f"Resume source tag mismatch: {name}")
     output_path = _resolve_path(project_dir, output_dir) / run_id
+    if require_checkpoint_manifest:
+        # A prepared cache from a legacy size-only check cannot satisfy this request.
+        output_path /= "manifest-verified"
     output_path.mkdir(parents=True, exist_ok=True)
 
     if training_output_dir is not None:
@@ -396,7 +406,8 @@ def prepare_resume_checkpoint(
 
     _validate_checkpoint(local_checkpoint, require_full_checkpoint=require_full_checkpoint,
                          world_size=world_size, fp16=fp16)
-    _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, manifest_artifact)
+    _verify_checkpoint_download(mlflow, run_id, artifact_path, local_checkpoint, output_path, manifest_artifact,
+                                require_checkpoint_manifest=require_checkpoint_manifest)
     if training_output_dir is not None:
         from scripts.checkpoint_storage import stage_resume
         state = json.loads((local_checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
@@ -413,6 +424,7 @@ def prepare_resume_checkpoint(
                     run_id=run_id, artifact_path=str(Path(artifact_path).parent / best_name),
                     require_full_checkpoint=True, world_size=world_size, fp16=fp16,
                     manifest_artifact=manifest_artifact,
+                    require_checkpoint_manifest=require_checkpoint_manifest,
                 ))
         plan = stage_resume(local_checkpoint, best_checkpoint, output_path, training_output,
                             run_id=run_id, artifact_path=artifact_path)
@@ -503,6 +515,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--manifest-artifact", help="Legacy run manifest path (default: training/artifact_manifest.json)")
+    parser.add_argument("--require-checkpoint-manifest", action="store_true",
+                        help="Require the per-checkpoint SHA256 manifest for latest and best")
     parser.add_argument("--training-output-dir", help="Relocate saved best checkpoint for load_best_model_at_end")
     parser.add_argument("--expected-run-tags", type=json.loads, help="Required source tags for full resume")
     parser.add_argument("--adapter-sha256", help="Download only the pinned adapter from the selected artifact")
@@ -514,7 +528,7 @@ def main() -> None:
     args = parse_args()
     if args.adapter_sha256 is not None:
         if (args.training_output_dir or args.run_uuid
-                or args.expected_run_tags is not None or args.manifest_artifact):
+                or args.expected_run_tags is not None or args.manifest_artifact or args.require_checkpoint_manifest):
             raise ValueError("Adapter-only mode requires a run ID and uses the selected artifact's manifest")
         adapter = prepare_training_adapter(args.project_dir, args.output_dir, args.run_id,
                                            args.adapter_sha256, args.adapter_base_revision, args.artifact_path)
@@ -542,6 +556,7 @@ def main() -> None:
         manifest_artifact=args.manifest_artifact,
         training_output_dir=args.training_output_dir,
         expected_run_tags=args.expected_run_tags,
+        require_checkpoint_manifest=args.require_checkpoint_manifest,
     )
 
     state_path = Path(args.state_path)
